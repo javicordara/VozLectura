@@ -14,6 +14,8 @@
 
 ## English Overview
 
+I originally started **VozLectura** to improve my English: being able to read and listen to the same book in both Spanish and English makes it much easier—and far more enjoyable—to understand context, pick up vocabulary, and build fluency naturally.
+
 VozLectura turns any DRM-free `.epub` book into a synchronized, offline read-aloud experience with **zero cloud API fees**, **zero GPU requirement**, and **full privacy**. Run it on your PC (Windows, Linux, macOS, or Docker) and listen on your desktop or Android phone over Wi-Fi or completely offline as an installable PWA.
 
 ### Key Features
@@ -64,6 +66,8 @@ Then open **`http://localhost:8085`** in your browser. Two bilingual sample EPUB
 
 <a name="vozlectura-en-español"></a>
 ## VozLectura en Español
+
+Empecé **VozLectura** para mejorar mi nivel de inglés: poder leer y escuchar el mismo libro en castellano y en inglés hace que sea mucho más sencillo —y entretenido— entender el contexto, ganar vocabulario y avanzar con el idioma de forma natural.
 
 VozLectura convierte cualquier libro `.epub` sin DRM en un audiolibro y lector de estudio **100% local**, **sin suscripciones ni costes de API**, **sin necesidad de tarjeta gráfica (solo CPU)** y con privacidad total.
 
