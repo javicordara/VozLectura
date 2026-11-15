@@ -1,0 +1,1442 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#1e293b" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <title>VozLectura — Lector EPUB TTS (Piper &amp; Kokoro)</title>
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="apple-touch-icon" href="/icon-192.png" />
+  <link rel="stylesheet" href="/styles.css?v=1.0.0" />
+</head>
+<body class="theme-sepia font-serif">
+  <!-- Barra superior -->
+  <header class="topbar">
+    <div class="topbar-left">
+      <button id="btn-back-library" class="icon-btn hidden" title="Volver a la biblioteca">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M19 12H5M12 19l-7-7 7-7"/>
+        </svg>
+        <span class="hide-mobile">Biblioteca</span>
+      </button>
+      <button id="btn-toggle-toc" class="icon-btn hidden" title="Índice de capítulos">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="15" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+        <span class="hide-mobile">Capítulos</span>
+      </button>
+      <div class="brand" id="brand-logo">
+        <img src="/icon.svg" alt="Logo" class="brand-icon" />
+        <span class="brand-title hide-mobile">VozLectura <small>EPUB TTS</small></span>
+      </div>
+    </div>
+
+    <div class="topbar-center" id="reader-book-header">
+      <span id="current-book-title" class="truncate-text"></span>
+    </div>
+
+    <div class="topbar-right">
+      <button id="btn-topbar-add-book" class="icon-btn topbar-add-btn" title="Añadir nuevo libro EPUB o Media Overlay">
+        <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="12" y1="5" x2="12" y2="19"/>
+          <line x1="5" y1="12" x2="19" y2="12"/>
+        </svg>
+        <span class="hide-mobile">Añadir EPUB</span>
+      </button>
+
+      <button id="btn-open-study" class="icon-btn hidden" title="Cuaderno de lectura, palabras subrayadas, pasajes resaltados y nota Markdown para Obsidian">
+        <span>📓</span>
+        <span class="hide-mobile" id="btn-open-study-label">Notas / Obsidian</span>
+      </button>
+
+      <button id="btn-open-pairing" class="icon-btn hidden" title="Emparejar este libro con su versión en Inglés / Castellano">
+        <span class="pair-btn-icon">EN⇄ES</span>
+        <span class="hide-mobile" id="btn-open-pairing-label">Emparejar EN/ES</span>
+      </button>
+
+      <button id="btn-open-analytics" class="icon-btn" title="Calendario de Hábitos de Lectura, Valoraciones, Autores y Resumen Anual">
+        <span>📊</span>
+        <span class="hide-mobile" id="btn-open-analytics-label">Hábitos</span>
+        <span id="analytics-streak-badge" class="queue-live-badge hidden">🔥 1</span>
+      </button>
+
+      <span class="topbar-camera-spacer" aria-hidden="true"></span>
+
+      <button id="btn-open-offline" class="icon-btn" title="Guardar libros y audios en la memoria de este móvil/PC para leer y escuchar sin conexión al servidor">
+        <span>📲</span>
+        <span class="hide-mobile" id="btn-open-offline-label">Offline</span>
+        <span id="offline-status-badge" class="queue-live-badge hidden">0</span>
+      </button>
+
+      <button id="btn-open-exports" class="icon-btn" title="Abrir Cola de Conversión de Ficheros (M4B, EPUB3 Media Overlay y Caché)">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/>
+          <line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        <span class="hide-mobile" id="btn-open-exports-label">Cola de Conversión</span>
+        <span id="exports-queue-badge" class="queue-live-badge hidden">0</span>
+      </button>
+
+      <button id="btn-open-models" class="icon-btn" title="Gestionar motores y voces TTS (Piper / Kokoro)">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/>
+        </svg>
+        <span class="hide-mobile">Voces IA</span>
+      </button>
+
+      <button id="btn-toggle-fullscreen" class="icon-btn" title="Activar / Salir de Pantalla Completa nativa (Android y PC)">
+        <svg id="icon-fs-enter" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+        </svg>
+        <svg id="icon-fs-exit" class="hidden" viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3"/>
+        </svg>
+        <span class="hide-mobile" id="btn-toggle-fullscreen-label">Pantalla completa</span>
+      </button>
+
+      <button id="btn-lang-toggle" class="icon-btn lang-toggle-btn" title="Switch interface language to English (ES / EN)">
+        <span>🌐</span>
+        <span class="lang-code">ES</span>
+      </button>
+
+      <button id="btn-open-appearance" class="icon-btn" title="Ajustes de lectura y tema">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="5"/>
+          <path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/>
+        </svg>
+        <span class="hide-mobile">Apariencia</span>
+      </button>
+    </div>
+  </header>
+
+  <!-- Popover de apariencia -->
+  <div id="appearance-popover" class="popover hidden">
+    <div class="popover-section">
+      <label class="popover-label">Tema de color</label>
+      <div class="theme-buttons">
+        <button data-theme="theme-light" class="theme-chip light-chip">Claro</button>
+        <button data-theme="theme-sepia" class="theme-chip sepia-chip active">Sepia</button>
+        <button data-theme="theme-dark" class="theme-chip dark-chip">Noche</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Tipografía</label>
+      <div class="font-buttons">
+        <button data-font="font-serif" class="font-chip active">Serif (Libro)</button>
+        <button data-font="font-sans" class="font-chip">Sans-Serif</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Tamaño de letra</label>
+      <div class="size-controls">
+        <button id="btn-font-dec" class="size-btn">A−</button>
+        <span id="font-size-label">19px</span>
+        <button id="btn-font-inc" class="size-btn">A+</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Interlineado</label>
+      <div class="size-controls">
+        <button id="btn-lh-dec" class="size-btn">−</button>
+        <span id="line-height-label">1.80</span>
+        <button id="btn-lh-inc" class="size-btn">+</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Modo de lectura</label>
+      <div class="flow-buttons">
+        <button data-flow="scroll" class="flow-chip active">📜 Scroll infinito</button>
+        <button data-flow="paginated" class="flow-chip">📖 Paginado (Hojas)</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Columnas (Pantalla ancha)</label>
+      <div class="col-buttons">
+        <button data-cols="1" class="col-chip active">1 Columna</button>
+        <button data-cols="2" class="col-chip">2 Columnas</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Alineación de columna</label>
+      <div class="align-buttons">
+        <button data-align="justify" class="align-chip active">☰ Justificado</button>
+        <button data-align="left" class="align-chip">☷ Izquierda</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Sangrado de párrafo</label>
+      <div class="indent-buttons">
+        <button data-indent="none" class="indent-chip">Sin sangría</button>
+        <button data-indent="normal" class="indent-chip active">Clásico (1.5em)</button>
+        <button data-indent="wide" class="indent-chip">Amplio (2.5em)</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label">Márgenes / Ancho de texto</label>
+      <div class="margin-buttons">
+        <button data-margin="narrow" class="margin-chip">Estrecho</button>
+        <button data-margin="normal" class="margin-chip active">Medio</button>
+        <button data-margin="wide" class="margin-chip">Ancho</button>
+        <button data-margin="full" class="margin-chip">Total</button>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="popover-label" for="select-sentence-gap">Cadencia entre frases / Bluetooth Coche</label>
+      <select id="select-sentence-gap" class="player-select" style="width:100%;margin-top:4px;font-size:0.84rem">
+        <option value="auto" selected>🚗 Automático (Normal en app / Recortar en Coche)</option>
+        <option value="normal">📖 Normal siempre (Tal cual se genera en la app)</option>
+        <option value="car">🚗 Modo Coche siempre (Recortes siempre activos)</option>
+        <option value="tight">⚡ Rápido (Solo recorte de silencios)</option>
+      </select>
+      <div id="car-bt-auto-panel" class="car-bt-auto-panel">
+        <div class="car-bt-status-row">
+          <span id="car-bt-status-badge" class="car-bt-status-pill">📖 Modo actual: Normal (Sin recortes)</span>
+          <button id="btn-detect-car-bt" type="button" class="secondary-btn car-bt-detect-btn" title="Permite al navegador leer el nombre del Bluetooth conectado para activar los recortes automáticamente en el coche">
+            🔍 Vincular Bluetooth
+          </button>
+        </div>
+        <div class="car-bt-input-row">
+          <input
+            type="text"
+            id="input-car-bt-name"
+            class="text-input car-bt-input"
+            placeholder="Nombre Bluetooth de tu coche (ej: SEAT, Kia, My Car...)"
+          />
+        </div>
+        <div id="car-bt-devices-list" class="car-bt-devices-list hidden"></div>
+      </div>
+    </div>
+    <div class="popover-section">
+      <label class="toggle-row" style="margin-bottom:8px">
+        <input type="checkbox" id="chk-autoscroll" checked />
+        <span>Seguimiento automático de frase</span>
+      </label>
+      <label class="toggle-row" style="margin-bottom:8px">
+        <input type="checkbox" id="chk-auto-fullscreen" checked />
+        <span>Pantalla completa automática al abrir libro (App nativa)</span>
+      </label>
+      <label class="toggle-row">
+        <input type="checkbox" id="chk-immersive-reader" />
+        <span>Modo inmersivo (ocultar barra superior al leer)</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- VISTA 1: BIBLIOTECA -->
+  <main id="library-view" class="view-container">
+    <input type="file" id="epub-file-input" accept=".epub,application/epub+zip,.mp3,.m4b,.m4a,.wav,.ogg,.flac" multiple hidden />
+
+    <!-- Barra de progreso de subida (solo visible mientras se sube un EPUB) -->
+    <div id="epub-upload-progress-box" class="export-progress-box hidden" style="margin-bottom:14px">
+      <div class="export-progress-header">
+        <span id="epub-upload-phase" class="export-phase-badge">Subiendo archivo EPUB...</span>
+        <strong id="epub-upload-pct">0%</strong>
+      </div>
+      <div class="export-progress-bar-bg">
+        <div id="epub-upload-bar" class="export-progress-bar-fill" style="width:0%"></div>
+      </div>
+    </div>
+
+    <!-- Banner cuando el servidor está desconectado o cambió de IP -->
+    <section id="offline-connection-banner" class="library-queue-banner hidden" style="border-color:#38bdf8;background:rgba(56,189,248,0.10)">
+      <div class="library-queue-info">
+        <span style="font-size:1.3rem">📴</span>
+        <div>
+          <strong id="offline-banner-title">Modo Sin Conexión Activo — Mostrando tus libros guardados en este dispositivo</strong>
+          <p id="offline-banner-subtitle">Puedes leer y escuchar tus libros locales sin conexión. Si tu ordenador cambió de IP en el Wi-Fi, pulsa «Buscar nueva IP del servidor».</p>
+        </div>
+      </div>
+      <div class="library-queue-right" style="display:flex;gap:8px;flex-wrap:wrap">
+        <button id="btn-banner-scan-ip" class="primary-btn" style="padding:7px 14px;font-size:0.82rem">
+          🔍 Buscar nueva IP del servidor
+        </button>
+        <button id="btn-banner-open-offline" class="secondary-btn" style="padding:7px 12px;font-size:0.82rem">
+          📲 Mis libros locales
+        </button>
+      </div>
+    </section>
+
+    <!-- Banner en vivo de Cola de Conversión en la pantalla principal -->
+    <section id="library-queue-banner" class="library-queue-banner hidden">
+      <div class="library-queue-info">
+        <span class="status-dot playing"></span>
+        <div>
+          <strong id="library-queue-title">Conversión en curso...</strong>
+          <p id="library-queue-subtitle">Codificando frases en segundo plano</p>
+        </div>
+      </div>
+      <div class="library-queue-right">
+        <div class="library-queue-mini-bar">
+          <div id="library-queue-bar-fill" class="export-bar-fill" style="width:0%"></div>
+        </div>
+        <button id="btn-banner-open-queue" class="primary-btn" style="padding:7px 14px;font-size:0.82rem">
+          Ver cola de conversión
+        </button>
+      </div>
+    </section>
+
+    <section class="library-section" id="drop-zone">
+      <!-- Cabecera compacta de Biblioteca con acciones rápidas integradas -->
+      <div class="library-header-bar">
+        <div class="library-header-title">
+          <h2>Tu Biblioteca</h2>
+          <span id="library-count" class="badge-pill">0 libros</span>
+        </div>
+        <div class="library-header-actions">
+          <button id="btn-select-epub" class="primary-btn lib-header-btn" type="button" title="Cargar archivo .epub (normal o EPUB 3 Media Overlay)">
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19"/>
+              <line x1="5" y1="12" x2="19" y2="12"/>
+            </svg>
+            <span>Añadir EPUB</span>
+          </button>
+          <button id="btn-open-audiobook-sync" class="secondary-btn lib-header-btn" type="button" title="Sincronizar un EPUB con su Audiolibro MP3 / M4B / M4A">
+            <span>🎧</span>
+            <span>EPUB + Audio</span>
+          </button>
+          <button id="btn-library-open-analytics" class="secondary-btn lib-header-btn hide-mobile" type="button" title="Abrir Calendario de Hábitos y Estadísticas">
+            <span>📊</span>
+            <span>Hábitos y Estadísticas</span>
+          </button>
+          <button id="btn-library-open-queue" class="secondary-btn lib-header-btn hide-mobile" type="button" title="Abrir Cola de conversión de ficheros">
+            <span>⚡</span>
+            <span>Cola (<span id="library-queue-count">0</span>)</span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Panel Profesional de Búsqueda, Filtros y Ordenación (Contraíble) -->
+      <div id="library-filters-bar" class="library-filters-bar is-collapsed">
+        <div id="btn-toggle-lib-filters" class="lib-filters-collapse-header" role="button" tabindex="0" aria-expanded="false" title="Mostrar u ocultar buscador, filtros y ordenación">
+          <div class="lib-filters-collapse-left">
+            <span class="lib-filters-collapse-title">🔍 Filtros y orden</span>
+            <span id="lib-filters-summary-badge" class="lib-filters-summary-badge">🕒 Reciente 1º</span>
+          </div>
+          <div class="lib-filters-collapse-right">
+            <span id="lib-filters-toggle-label" class="lib-filters-toggle-btn">Desplegar ▾</span>
+          </div>
+        </div>
+
+        <div id="library-filters-body" class="library-filters-body hidden">
+          <div class="library-toolbar-top">
+            <div class="lib-search-box">
+              <svg class="lib-search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="11" cy="11" r="8"/>
+                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+              </svg>
+              <input type="search" id="lib-filter-search" class="lib-search-input" placeholder="Buscar por título, autor o género..." />
+            </div>
+
+            <div class="lib-sort-controls">
+              <div class="lib-sort-select-wrap">
+                <label for="lib-sort-by" class="lib-sort-prefix">↕️ Ordenar:</label>
+                <select id="lib-sort-by" class="lib-toolbar-select lib-sort-select">
+                  <option value="updated_at" selected>🕒 Tiempo desde última lectura</option>
+                  <option value="added_at">📥 Fecha de adición</option>
+                  <option value="rating">⭐ Nota / Valoración</option>
+                  <option value="estimated_pages">📄 Nº de páginas</option>
+                  <option value="author">✍️ Autor</option>
+                  <option value="published_date">📅 Fecha de publicación</option>
+                  <option value="title">🔤 Título</option>
+                  <option value="progress_pct">📈 % Leído</option>
+                </select>
+              </div>
+              <button id="btn-lib-sort-dir" class="secondary-btn lib-sort-dir-btn" type="button" title="Invertir orden Ascendente / Descendente">
+                ⬆️ Menor a mayor (Reciente 1º)
+              </button>
+              <button id="btn-lib-reset-filters" class="secondary-btn lib-reset-btn hidden" type="button" title="Limpiar todos los filtros activos">
+                ↺ Limpiar
+              </button>
+            </div>
+          </div>
+
+          <div class="library-filters-grid">
+            <div class="lib-filter-group">
+              <label for="lib-filter-author">✍️ Autor</label>
+              <select id="lib-filter-author" class="lib-toolbar-select">
+                <option value="all">Todos los autores</option>
+              </select>
+            </div>
+            <div class="lib-filter-group">
+              <label for="lib-filter-genre">🏷️ Tipo / Género</label>
+              <select id="lib-filter-genre" class="lib-toolbar-select">
+                <option value="all">Todos los géneros</option>
+              </select>
+            </div>
+            <div class="lib-filter-group">
+              <label for="lib-filter-status">📘 Estado de lectura</label>
+              <select id="lib-filter-status" class="lib-toolbar-select">
+                <option value="all">Todos los estados</option>
+                <option value="reading">📖 Leyendo ahora</option>
+                <option value="wishlist">🔖 Pendiente / Sin empezar</option>
+                <option value="completed">✅ Terminado / Leído</option>
+                <option value="paused">⏸ En pausa / Abandonado</option>
+              </select>
+            </div>
+            <div class="lib-filter-group">
+              <label for="lib-filter-rating">⭐ Valoración</label>
+              <select id="lib-filter-rating" class="lib-toolbar-select">
+                <option value="all">Todas las notas</option>
+                <option value="5">★★★★★ Solo 5 estrellas</option>
+                <option value="4.5+">★★★★½ 4,5 estrellas o más</option>
+                <option value="4+">★★★★☆ 4 estrellas o más</option>
+                <option value="3.5+">★★★½☆ 3,5 estrellas o más</option>
+                <option value="3+">★★★☆☆ 3 estrellas o más</option>
+                <option value="2+">★★☆☆☆ 2 estrellas o más</option>
+                <option value="1+">★☆☆☆☆ 1 estrella o más</option>
+                <option value="rated">Con nota (0,5–5 ★)</option>
+                <option value="unrated">Sin valorar aún</option>
+              </select>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="books-grid" class="books-grid">
+        <!-- Tarjetas de libros generadas dinámicamente -->
+      </div>
+    </section>
+
+    <footer class="library-footer">
+      <span id="footer-version-note" class="footer-version-note" title="Pulsa para comprobar y actualizar a la última versión del servidor">VozLectura 1.0.0</span>
+      <span class="footer-sep" aria-hidden="true">·</span>
+      <a href="https://ko-fi.com/javicordara" target="_blank" rel="noopener noreferrer" class="footer-support-link" title="Apoyar el desarrollo de VozLectura en Ko-fi">☕ Apoyar el proyecto</a>
+    </footer>
+  </main>
+
+  <!-- VISTA 2: LECTOR Y VISUALIZADOR -->
+  <div id="reader-view" class="reader-layout hidden">
+    <!-- Panel lateral de capítulos (TOC) -->
+    <aside id="toc-sidebar" class="toc-sidebar hidden">
+      <div class="toc-header">
+        <h3>Capítulos</h3>
+        <button id="btn-close-toc" class="icon-btn" title="Cerrar índice">✕</button>
+      </div>
+      <ul id="toc-list" class="toc-list"></ul>
+    </aside>
+
+    <!-- Área principal de lectura -->
+    <article class="reader-main" id="reader-scroll-container">
+      <div class="chapter-meta-bar">
+        <span id="chapter-badge" class="badge-pill">Capítulo 1</span>
+        <div class="chapter-meta-right">
+          <button id="btn-switch-paired" class="flow-quick-btn paired-switch-btn hidden" title="Saltar ahora mismo a este capítulo en la otra versión del libro">
+            🔄 Ir a versión ES
+          </button>
+          <button id="btn-toggle-flow" class="flow-quick-btn" title="Alternar entre Scroll infinito y Paginado por hojas">
+            📖 Paginado
+          </button>
+          <button id="btn-quick-theme" class="flow-quick-btn" title="Cambiar rápido entre Modo Noche, Sepia y Claro">
+            🌙 Noche
+          </button>
+          <button id="btn-toggle-immersive" class="flow-quick-btn" title="Modo inmersivo a pantalla completa sin barra superior">
+            ⛶ Inmersivo
+          </button>
+          <span id="page-counter" class="page-progress-badge hidden">Hoja 1 / 1</span>
+          <span id="sentence-counter" class="sentence-progress-text">Frase 0 / 0</span>
+        </div>
+      </div>
+
+      <!-- Botón flotante discreto para salir del modo inmersivo -->
+      <button id="btn-exit-immersive" class="exit-immersive-pill hidden" title="Mostrar barra superior y controles">
+        ⛶ Mostrar barra
+      </button>
+
+      <div id="chapter-viewport-wrap" class="chapter-viewport-wrap">
+        <button id="btn-page-prev" class="page-edge-btn page-edge-prev hidden" title="Hoja anterior (RePág)">
+          ‹
+        </button>
+
+        <div id="chapter-viewport" class="chapter-viewport">
+          <div id="chapter-content" class="epub-content" tabindex="0">
+            <!-- HTML del capítulo con <span class="tts-sentence"> inyectado -->
+          </div>
+        </div>
+
+        <button id="btn-page-next" class="page-edge-btn page-edge-next hidden" title="Hoja siguiente (AvPág)">
+          ›
+        </button>
+      </div>
+
+      <div id="pagination-footer" class="pagination-footer hidden">
+        <button id="btn-footer-page-prev" class="secondary-btn page-nav-btn">← Hoja anterior</button>
+        <span id="pagination-footer-label" class="pagination-footer-label">Hoja 1 de 1 • 📘 0% leído</span>
+        <button id="btn-footer-page-next" class="secondary-btn page-nav-btn">Hoja siguiente →</button>
+      </div>
+
+      <div id="chapter-nav-footer" class="chapter-nav-footer">
+        <button id="btn-prev-chapter" class="secondary-btn">← Capítulo anterior</button>
+        <span id="chapter-footer-book-pct" class="pagination-footer-label">📘 0% del libro leído</span>
+        <button id="btn-next-chapter" class="secondary-btn">Capítulo siguiente →</button>
+      </div>
+    </article>
+
+    <!-- Barra inferior de control TTS -->
+    <footer class="tts-player-bar">
+      <div class="player-progress-track">
+        <div id="player-progress-fill" class="player-progress-fill" style="width: 0%"></div>
+      </div>
+
+      <div class="player-controls-grid">
+        <!-- Controles de transporte -->
+        <div class="transport-group">
+          <button id="btn-prev-sentence" class="ctrl-btn" title="Frase anterior (Flecha Izquierda)">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="19 20 9 12 19 4 19 20"/><line x1="5" y1="19" x2="5" y2="5"/>
+            </svg>
+          </button>
+
+          <button id="btn-play-pause" class="play-fab" title="Reproducir / Pausar (Espacio)">
+            <svg id="icon-play" viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+              <polygon points="6 4 20 12 6 20 6 4"/>
+            </svg>
+            <svg id="icon-pause" class="hidden" viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+              <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
+            </svg>
+            <span id="icon-loading" class="spinner hidden"></span>
+          </button>
+
+          <button id="btn-next-sentence" class="ctrl-btn" title="Frase siguiente (Flecha Derecha)">
+            <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 4 15 12 5 20 5 4"/><line x1="19" y1="5" x2="19" y2="19"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- Frase activa en miniatura -->
+        <div class="now-reading-preview">
+          <div class="status-dot-row" style="justify-content:space-between;gap:8px;flex-wrap:wrap">
+            <div style="display:flex;align-items:center;gap:6px;min-width:0">
+              <span id="tts-status-indicator" class="status-dot"></span>
+              <span id="tts-status-text" class="status-label">Listo — Pulsa en cualquier frase o en Play</span>
+            </div>
+            <span id="reader-book-progress-badge" class="reader-book-pct-pill" title="Porcentaje total leído del libro hasta la fecha">📘 Libro: 0% leído</span>
+          </div>
+          <p id="active-sentence-preview" class="preview-line">Selecciona una frase del texto para comenzar la lectura en voz alta.</p>
+        </div>
+
+        <!-- Selección de Motor, Voz y Velocidad -->
+        <div class="voice-settings-group">
+          <div class="select-wrapper">
+            <label for="select-voice">Motor / Voz TTS</label>
+            <select id="select-voice" class="player-select"></select>
+          </div>
+
+          <div class="select-wrapper speed-wrapper">
+            <label for="select-speed">Velocidad</label>
+            <select id="select-speed" class="player-select">
+              <option value="0.75">0.75×</option>
+              <option value="0.9">0.90×</option>
+              <option value="1.0" selected>1.00×</option>
+              <option value="1.15">1.15×</option>
+              <option value="1.25">1.25×</option>
+              <option value="1.5">1.50×</option>
+              <option value="1.75">1.75×</option>
+              <option value="2.0">2.00×</option>
+            </select>
+          </div>
+
+          <button
+            id="btn-quick-car-mode"
+            type="button"
+            class="car-mode-quick-btn"
+            title="Modo Coche (Recorte de pausas): Desactivado — Sonando tal cual se genera en la app. Pulsa para activar/desactivar."
+          >
+            <span id="car-mode-quick-icon">🚗</span>
+            <span id="car-mode-quick-label">Off</span>
+          </button>
+        </div>
+      </div>
+    </footer>
+  </div>
+
+  <!-- MODAL: GESTOR DE VOCES LOCALES (PIPER & KOKORO) -->
+  <div id="models-modal" class="modal-backdrop hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h2>Motores TTS y Voces Neurales Locales (Piper MIT &amp; Kokoro 82M Apache 2.0)</h2>
+          <p class="modal-subtitle">
+            <span id="gpu-status-badge" class="badge-pill">ONNX Runtime CPU</span>
+            Descarga las voces que prefieras para leer sin conexión y sin costes de API.
+          </p>
+        </div>
+        <button id="btn-close-models" class="icon-btn">✕</button>
+      </div>
+
+      <div id="models-list" class="models-list">
+        <!-- Lista de voces con estado de descarga -->
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: COLA DE CONVERSIÓN DE FICHEROS (M4B, EPUB3 MEDIA OVERLAY Y CACHÉ PERMANENTE) -->
+  <div id="exports-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width:780px">
+      <div class="modal-header">
+        <div>
+          <h2>🎧 Cola de Conversión de Ficheros (M4B, EPUB3 Media Overlay y Caché)</h2>
+          <p class="modal-subtitle">
+            Gestiona todas las conversiones activas, en pausa o completadas de tu biblioteca. Una vez codificado un libro con una voz, queda guardado en disco y consume 0% de CPU/GPU.
+          </p>
+        </div>
+        <button id="btn-close-exports" class="icon-btn">✕</button>
+      </div>
+
+      <div class="clone-voice-panel">
+        <h3>⚡ Añadir o iniciar conversión de un libro</h3>
+        <p class="clone-help">Selecciona el libro y la voz para generar su caché permanente, el audiolibro <code>.m4b</code> con capítulos y el <code>.epub</code> con Media Overlays (SMIL sincronizado).</p>
+        <div class="clone-form-row" style="margin-bottom:8px">
+          <select id="export-book-select" class="player-select" style="flex:1;min-width:220px;max-width:none" title="Libro a convertir"></select>
+        </div>
+        <div class="clone-form-row">
+          <select id="export-voice-select" class="player-select" style="flex:1;min-width:220px;max-width:none"></select>
+          <select id="export-speed-select" class="player-select">
+            <option value="0.9">0.90×</option>
+            <option value="1.0" selected>1.00×</option>
+            <option value="1.15">1.15×</option>
+            <option value="1.25">1.25×</option>
+          </select>
+          <button id="btn-start-export" class="primary-btn">Iniciar conversión</button>
+        </div>
+
+        <div style="display:flex;gap:18px;margin-top:8px;flex-wrap:wrap;justify-content:space-between;align-items:center">
+          <div style="display:flex;gap:18px;flex-wrap:wrap">
+            <label class="toggle-row" style="font-size:0.82rem">
+              <input type="checkbox" id="chk-export-m4b" checked />
+              <span>Generar Audiolibro <code>.m4b</code></span>
+            </label>
+            <label class="toggle-row" style="font-size:0.82rem">
+              <input type="checkbox" id="chk-export-epub" checked />
+              <span>Generar <code>.epub</code> Media Overlay (texto + audio)</span>
+            </label>
+          </div>
+          <label class="toggle-row" style="font-size:0.8rem;color:var(--text-secondary)">
+            <input type="checkbox" id="chk-export-filter-book" />
+            <span>Mostrar solo del libro seleccionado arriba</span>
+          </label>
+        </div>
+
+        <div style="margin-top:12px;padding-top:10px;border-top:1px dashed var(--border-color);display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px">
+          <span style="font-size:0.82rem;color:var(--text-secondary)">¿Ya tienes el audiolibro en <strong>.mp3, .m4b o .m4a</strong>?</span>
+          <button id="btn-open-audiobook-sync-from-exports" class="secondary-btn" style="padding:6px 12px;font-size:0.8rem;border-color:var(--accent)">🎧 Sincronizar audiolibro externo (MP3 / M4B / M4A)...</button>
+        </div>
+
+        <!-- Barra de progreso activa -->
+        <div id="export-job-box" class="export-job-box hidden">
+          <div class="export-job-header">
+            <span id="export-job-phase">Codificando...</span>
+            <strong id="export-job-pct">0%</strong>
+          </div>
+          <div class="export-bar-bg">
+            <div id="export-bar-fill" class="export-bar-fill" style="width:0%"></div>
+          </div>
+          <div class="export-job-footer">
+            <small id="export-job-counts">Frase 0 / 0</small>
+            <div style="display:flex;gap:8px">
+              <button id="btn-cancel-export" class="secondary-btn" style="padding:4px 10px;font-size:0.78rem">⏸ Pausar</button>
+              <button id="btn-delete-active-export" class="delete-book-btn" style="padding:4px 10px;font-size:0.78rem;font-weight:600">🗑 Cancelar y borrar</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="exports-list" class="models-list">
+        <!-- Lista global de conversiones de la biblioteca -->
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: SINCRONIZAR EPUB + AUDIOLIBRO EXTERNO (MP3 / M4B / M4A) -->
+  <div id="audiobook-sync-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width:640px">
+      <div class="modal-header">
+        <div>
+          <h2>🎧 Sincronizar EPUB + Audiolibro (MP3 / M4B / M4A)</h2>
+          <p class="modal-subtitle">
+            Alinea automáticamente el texto del EPUB con la voz del audiolibro para leer y escuchar frase a frase en la app y generar el archivo <code>.epub</code> con Media Overlays (SMIL 3.0).
+          </p>
+        </div>
+        <button id="btn-close-audiobook-sync" class="icon-btn">✕</button>
+      </div>
+
+      <div class="clone-voice-panel" style="border-bottom:none">
+        <div class="pair-field-group">
+          <label class="popover-label">1. ¿Con qué libro EPUB quieres sincronizar el audiolibro?</label>
+          <select id="sync-target-mode" class="player-select" style="width:100%;max-width:none;padding:9px 12px;font-size:0.9rem;margin-bottom:8px">
+            <option value="new">📖 Subir un archivo .epub nuevo desde mi dispositivo</option>
+            <option value="existing">📚 Usar un libro que ya está en mi biblioteca</option>
+          </select>
+
+          <div id="sync-new-epub-box" style="margin-top:8px">
+            <input type="file" id="sync-epub-input" accept=".epub,application/epub+zip" hidden />
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+              <button id="btn-pick-sync-epub" class="secondary-btn">📂 Seleccionar archivo .epub</button>
+              <span id="sync-epub-filename" class="clone-file-label">Ningún archivo .epub seleccionado</span>
+            </div>
+          </div>
+
+          <div id="sync-existing-book-box" class="hidden" style="margin-top:8px">
+            <select id="sync-existing-book-select" class="player-select" style="width:100%;max-width:none;padding:9px 12px;font-size:0.9rem"></select>
+          </div>
+        </div>
+
+        <div class="pair-field-group" style="margin-top:14px">
+          <label class="popover-label">2. Selecciona el audiolibro (.m4b, .m4a, .mp3, .wav, .ogg o .flac)</label>
+          <p class="clone-help" style="margin-bottom:8px">
+            Puedes seleccionar <strong>un único archivo completo</strong> (ej. <code>libro.m4b</code> o <code>libro.mp3</code>, con o sin capítulos incrustados) o <strong>varios archivos <code>.mp3</code></strong> numerados por capítulos.
+          </p>
+          <input type="file" id="sync-audio-input" accept=".mp3,.m4b,.m4a,.wav,.ogg,.flac,.aac,.opus,audio/*" multiple hidden />
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            <button id="btn-pick-sync-audio" class="secondary-btn">🎵 Seleccionar archivo(s) de audio (.mp3 / .m4b / .m4a)</button>
+            <span id="sync-audio-filenames" class="clone-file-label">Ningún archivo de audio seleccionado</span>
+          </div>
+        </div>
+
+        <div class="pair-field-group" style="margin-top:14px">
+          <label class="popover-label" for="sync-audiobook-label">3. Etiqueta de la pista de voz (opcional)</label>
+          <input type="text" id="sync-audiobook-label" class="text-input" style="width:100%" placeholder="Ej: 🎧 Audiolibro Original (Narrador Oficial)" />
+        </div>
+
+        <div style="display:flex;gap:18px;margin-top:12px;flex-wrap:wrap">
+          <label class="toggle-row" style="font-size:0.84rem">
+            <input type="checkbox" id="chk-sync-build-epub" checked />
+            <span>Generar <code>.epub</code> Media Overlay (SMIL 3.0 sincronizado)</span>
+          </label>
+          <label class="toggle-row" style="font-size:0.84rem">
+            <input type="checkbox" id="chk-sync-build-m4b" />
+            <span>Generar <code>.m4b</code> unificado con capítulos del EPUB (opcional)</span>
+          </label>
+        </div>
+
+        <div id="sync-upload-progress-box" class="export-job-box hidden" style="margin-top:14px">
+          <div class="export-job-header">
+            <span id="sync-upload-phase">Subiendo archivos al servidor...</span>
+            <strong id="sync-upload-pct">0%</strong>
+          </div>
+          <div class="export-bar-bg">
+            <div id="sync-upload-bar" class="export-bar-fill" style="width:0%"></div>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:18px">
+          <button id="btn-start-audiobook-sync" class="primary-btn" style="width:100%;justify-content:center;padding:11px 18px;font-size:0.95rem">
+            🔄 Subir, Sincronizar Texto + Voz y Generar EPUB Media Overlay
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: EMPAREJAMIENTO BILINGÜE (INGLÉS ↔ CASTELLANO) -->
+  <div id="pairing-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width:860px;width:95vw;max-height:90vh;display:flex;flex-direction:column">
+      <div class="modal-header">
+        <div>
+          <h2>🇬🇧 ↔ 🇪🇸 Lectura Bilingüe Alternada por Capítulos</h2>
+          <p class="modal-subtitle">
+            Libro actual: <strong id="pair-source-title">—</strong>
+          </p>
+        </div>
+        <button id="btn-close-pairing" class="icon-btn">✕</button>
+      </div>
+
+      <div class="clone-voice-panel" style="border-bottom:none;overflow-y:auto;flex:1">
+        <p class="clone-help" style="margin-bottom:12px">
+          Empareja las versiones en <strong>Inglés</strong> y <strong>Castellano</strong> del mismo libro. El asistente analiza automáticamente la longitud, los nombres propios y el inicio de cada capítulo para alinear la historia aunque una edición tenga portadillas extra (como <em>«Part I»</em>, dedicatorias o créditos) en medio.
+        </p>
+
+        <div class="pair-field-group">
+          <label class="popover-label" for="pair-partner-select">1. Selecciona el libro pareja en el otro idioma</label>
+          <select id="pair-partner-select" class="player-select" style="width:100%;max-width:none;padding:9px 12px;font-size:0.9rem"></select>
+        </div>
+
+        <div class="pair-field-group" id="pair-order-group">
+          <label class="popover-label" for="pair-primary-select">2. Orden de lectura en cada capítulo</label>
+          <select id="pair-primary-select" class="player-select" style="width:100%;max-width:none;padding:9px 12px;font-size:0.9rem"></select>
+        </div>
+
+        <div class="pair-field-group" id="pair-sync-group">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+            <label class="popover-label" style="margin-bottom:0">3. Comparador visual y alineación de capítulos</label>
+            <div style="display:flex;gap:6px;flex-wrap:wrap">
+              <button type="button" id="btn-auto-align-chapters" class="secondary-btn" style="padding:5px 10px;font-size:0.78rem" title="Analiza automáticamente el texto, nombres propios y longitud de cada capítulo para emparejarlos">
+                ✨ Auto-alinear por contenido
+              </button>
+              <button type="button" id="btn-apply-offset-from-here" class="secondary-btn" style="padding:5px 10px;font-size:0.78rem" title="Aplicar este mismo desfase a todos los capítulos siguientes a partir de este">
+                📐 Aplicar desfase desde aquí
+              </button>
+            </div>
+          </div>
+
+          <div class="pair-sync-grid">
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                <small style="color:var(--text-secondary)">Capítulo en este libro:</small>
+                <div style="display:flex;gap:4px">
+                  <button type="button" id="btn-pair-prev-src" class="secondary-btn" style="padding:2px 7px;font-size:0.75rem" title="Capítulo anterior">◀</button>
+                  <button type="button" id="btn-pair-next-src" class="secondary-btn" style="padding:2px 7px;font-size:0.75rem" title="Capítulo siguiente">▶</button>
+                </div>
+              </div>
+              <select id="pair-ch-source" class="player-select" style="width:100%;max-width:none"></select>
+            </div>
+            <div style="font-size:1.2rem;padding-top:22px;text-align:center">↔</div>
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+                <small style="color:var(--text-secondary)">Equivale a este capítulo en la pareja:</small>
+                <div style="display:flex;gap:4px">
+                  <button type="button" id="btn-pair-prev-tgt" class="secondary-btn" style="padding:2px 7px;font-size:0.75rem" title="Capítulo anterior en la pareja">◀</button>
+                  <button type="button" id="btn-pair-next-tgt" class="secondary-btn" style="padding:2px 7px;font-size:0.75rem" title="Capítulo siguiente en la pareja">▶</button>
+                </div>
+              </div>
+              <select id="pair-ch-target" class="player-select" style="width:100%;max-width:none"></select>
+            </div>
+          </div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-top:6px">
+            <small id="pair-offset-hint" class="clone-file-label" style="margin:0">Desfase de capítulos: 0 (mismo número de capítulo)</small>
+            <span id="pair-match-confidence-badge" class="badge-pill hidden" style="font-size:0.74rem"></span>
+          </div>
+
+          <!-- Vista previa lado a lado de las primeras frases de ambos capítulos (sin necesidad de abrir los EPUBs) -->
+          <div id="pair-live-preview-box" class="pair-live-preview-grid hidden">
+            <div class="pair-preview-card">
+              <div class="pair-preview-card-head">
+                <strong id="pair-prev-src-title">—</strong>
+                <span id="pair-prev-src-meta" class="badge-pill" style="font-size:0.7rem">0 fr.</span>
+              </div>
+              <p id="pair-prev-src-text" class="pair-preview-excerpt">—</p>
+              <small id="pair-prev-src-end" class="pair-preview-ending"></small>
+            </div>
+            <div class="pair-preview-card">
+              <div class="pair-preview-card-head">
+                <strong id="pair-prev-tgt-title">—</strong>
+                <span id="pair-prev-tgt-meta" class="badge-pill" style="font-size:0.7rem">0 fr.</span>
+              </div>
+              <p id="pair-prev-tgt-text" class="pair-preview-excerpt">—</p>
+              <small id="pair-prev-tgt-end" class="pair-preview-ending"></small>
+            </div>
+          </div>
+
+          <!-- Tabla desplegable con el mapa completo de todos los capítulos enfrentados -->
+          <details id="pair-map-details" class="pair-map-details hidden" style="margin-top:10px">
+            <summary class="pair-map-summary">
+              <span>🗺️ Ver / ajustar mapa completo capítulo a capítulo</span>
+              <span id="pair-map-count-badge" class="badge-pill" style="font-size:0.74rem">0 emparejados</span>
+            </summary>
+            <div id="pair-map-list" class="pair-map-list"></div>
+          </details>
+        </div>
+
+        <div class="pair-field-group" style="margin-top:12px">
+          <label class="toggle-row">
+            <input type="checkbox" id="chk-pair-autoswitch" checked />
+            <span><strong>Cambiar automáticamente de idioma al terminar cada capítulo</strong></span>
+          </label>
+        </div>
+
+        <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:16px;flex-wrap:wrap">
+          <button id="btn-unpair-books" class="delete-book-btn hidden" style="padding:9px 14px;font-weight:600">Desvincular libros</button>
+          <button id="btn-save-pairing" class="primary-btn">Guardar emparejamiento bilingüe</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- POPOVER FLOTANTE: DICCIONARIO Y TRADUCCIÓN (CLIC DERECHO EN PALABRA) -->
+  <div id="dict-popover" class="dict-popover hidden" role="dialog" aria-label="Diccionario y traducción">
+    <div class="dict-header">
+      <div class="dict-word-title-wrap">
+        <strong id="dict-word-title" class="dict-word-title">palabra</strong>
+        <span id="dict-phonetic" class="dict-phonetic"></span>
+        <button id="btn-dict-speak" class="dict-speak-btn" title="Escuchar pronunciación">🔊</button>
+      </div>
+      <button id="btn-close-dict" class="icon-btn" style="padding:3px 7px;font-size:0.85rem">✕</button>
+    </div>
+
+    <div id="dict-body" class="dict-body">
+      <!-- Contenido dinámico de traducción y diccionario -->
+    </div>
+
+    <div id="dict-footer" class="dict-footer">
+      <div class="dict-note-row">
+        <input type="text" id="dict-vocab-note" class="text-input dict-note-input" placeholder="Nota personal sobre esta palabra (opcional)..." />
+        <button id="btn-dict-underline" class="primary-btn dict-underline-btn" title="Subrayar esta palabra en el libro y guardarla en la nota de Obsidian">
+          🖍️ Subrayar palabra
+        </button>
+      </div>
+      <small id="dict-vocab-status" class="dict-vocab-status"></small>
+    </div>
+  </div>
+
+  <!-- BARRA FLOTANTE AL SELECCIONAR TEXTO EN EL LECTOR (RESALTAR PASAJES, DICCIONARIO Y AÑADIR NOTAS) -->
+  <div id="selection-toolbar" class="selection-toolbar hidden" role="toolbar" aria-label="Resaltar pasaje o tomar nota">
+    <button id="btn-selection-dict" class="sel-action-btn" title="Consultar palabra en el diccionario y traductor">
+      📖 Diccionario
+    </button>
+    <div class="sel-toolbar-divider"></div>
+    <span class="sel-toolbar-label">Resaltar:</span>
+    <button class="hl-color-btn hl-dot-yellow" data-hl-color="yellow" title="Resaltar en amarillo"></button>
+    <button class="hl-color-btn hl-dot-green" data-hl-color="green" title="Resaltar en verde"></button>
+    <button class="hl-color-btn hl-dot-blue" data-hl-color="blue" title="Resaltar en azul"></button>
+    <button class="hl-color-btn hl-dot-pink" data-hl-color="pink" title="Resaltar en rosa"></button>
+    <div class="sel-toolbar-divider"></div>
+    <button id="btn-selection-note" class="sel-action-btn" title="Resaltar este pasaje y escribir una nota para Obsidian">
+      📝 + Nota
+    </button>
+  </div>
+
+  <!-- MODAL: CUADERNO DE LECTURA, HÁBITOS, PASAJES, VOCABULARIO Y OBSIDIAN (.MD) -->
+  <div id="study-modal" class="modal-backdrop hidden">
+    <div class="modal-card study-modal-card">
+      <div class="modal-header">
+        <div>
+          <h2>📓 Cuaderno de Lectura y Conexión en Vivo con Obsidian</h2>
+          <p class="modal-subtitle">
+            Libro: <strong id="study-book-title">—</strong> • <span id="obsidian-sync-status-badge" style="color:#a855f7;font-weight:600">🟣 Sincronización bidireccional con Obsidian activa</span>
+          </p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button id="btn-sync-obsidian-now" class="secondary-btn" style="padding:7px 11px;font-size:0.79rem" title="Leer cambios hechos en Obsidian y guardar cambios de la app en tu bóveda">🔄 Sincronizar Obsidian</button>
+          <a id="btn-open-in-obsidian-app" href="#" class="secondary-btn" style="padding:7px 11px;font-size:0.79rem;text-decoration:none;color:#a855f7;border-color:rgba(168,85,247,0.45)" title="Abrir directamente esta nota en la aplicación Obsidian">🟣 Abrir en Obsidian</a>
+          <button id="btn-download-obsidian-top" class="primary-btn" style="padding:7px 12px;font-size:0.8rem">⬇️ Descargar .md</button>
+          <button id="btn-close-study" class="icon-btn">✕</button>
+        </div>
+      </div>
+
+      <!-- Pestañas del Cuaderno -->
+      <div class="study-tabs">
+        <button class="study-tab active" data-study-tab="habits">📊 Hábitos y Notas del Libro</button>
+        <button class="study-tab" data-study-tab="highlights">🖍️ Pasajes y Notas (<span id="study-count-highlights">0</span>)</button>
+        <button class="study-tab" data-study-tab="vocab">📚 Vocabulario (<span id="study-count-vocab">0</span>)</button>
+        <button class="study-tab" data-study-tab="obsidian">🟣 Conexión y Editor Obsidian (.md)</button>
+      </div>
+
+      <div class="study-body">
+        <!-- PESTAÑA 1: HÁBITOS DE LECTURA Y SESIONES -->
+        <div id="study-pane-habits" class="study-pane">
+          <div class="study-meta-grid">
+            <div class="study-field">
+              <label for="study-status">Estado de lectura</label>
+              <select id="study-status" class="player-select" style="max-width:none;width:100%;padding:7px 10px">
+                <option value="reading">📖 Leyendo actualmente</option>
+                <option value="completed">✅ Terminado</option>
+                <option value="paused">⏸ En pausa</option>
+                <option value="wishlist">🔖 Pendiente</option>
+              </select>
+            </div>
+            <div class="study-field">
+              <label for="study-started-at">Fecha de inicio</label>
+              <input type="date" id="study-started-at" class="text-input" style="min-width:0;width:100%" />
+            </div>
+            <div class="study-field">
+              <label for="study-finished-at">Fecha de finalización</label>
+              <input type="date" id="study-finished-at" class="text-input" style="min-width:0;width:100%" />
+            </div>
+            <div class="study-field">
+              <label for="study-times-read">Veces leído</label>
+              <input type="number" id="study-times-read" class="text-input" min="0" max="99" value="1" style="min-width:0;width:100%" />
+            </div>
+            <div class="study-field">
+              <label for="study-rating">Valoración personal (Saltos de 0,5 ★)</label>
+              <select id="study-rating" class="player-select" style="max-width:none;width:100%;padding:7px 10px">
+                <option value="0">— Sin puntuar —</option>
+                <option value="5">⭐⭐⭐⭐⭐ (5 / 5)</option>
+                <option value="4.5">⭐⭐⭐⭐½ (4,5 / 5)</option>
+                <option value="4">⭐⭐⭐⭐ (4 / 5)</option>
+                <option value="3.5">⭐⭐⭐½ (3,5 / 5)</option>
+                <option value="3">⭐⭐⭐ (3 / 5)</option>
+                <option value="2.5">⭐⭐½ (2,5 / 5)</option>
+                <option value="2">⭐⭐ (2 / 5)</option>
+                <option value="1.5">⭐½ (1,5 / 5)</option>
+                <option value="1">⭐ (1 / 5)</option>
+                <option value="0.5">½ (0,5 / 5)</option>
+              </select>
+            </div>
+            <div class="study-field">
+              <label for="study-genre">🏷️ Tipo / Género del libro</label>
+              <input type="text" id="study-genre" list="genre-suggestions-list" class="text-input" placeholder="Ej: Terror, Ciencia ficción, Fantasía..." style="min-width:0;width:100%" />
+              <datalist id="genre-suggestions-list">
+                <option value="Terror"></option>
+                <option value="Ciencia ficción"></option>
+                <option value="Fantasía"></option>
+                <option value="Mitología"></option>
+                <option value="Novela histórica"></option>
+                <option value="Thriller / Misterio"></option>
+                <option value="Novela negra"></option>
+                <option value="Aventura"></option>
+                <option value="Romance"></option>
+                <option value="Clásicos"></option>
+                <option value="Biografía"></option>
+                <option value="Historia"></option>
+                <option value="Filosofía"></option>
+                <option value="Ensayo / No ficción"></option>
+              </datalist>
+            </div>
+            <div class="study-field">
+              <label for="study-published-date">📅 Año / Fecha de publicación</label>
+              <input type="text" id="study-published-date" class="text-input" placeholder="Ej: 2006 o 2006-05-12" style="min-width:0;width:100%" />
+            </div>
+            <div class="study-field" style="display:flex;align-items:flex-end">
+              <label class="toggle-row" style="padding-bottom:6px">
+                <input type="checkbox" id="chk-study-auto-underline" checked />
+                <span>Subrayar automáticamente palabras buscadas en el diccionario</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="study-field" style="margin-top:14px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+              <label for="study-book-notes" style="margin:0;font-weight:700">📝 Notas del libro, resumen y apuntes integrados con Obsidian</label>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <button type="button" id="btn-toggle-notes-rich-view" class="secondary-btn" style="padding:4px 10px;font-size:0.76rem;border-color:rgba(168,85,247,0.5);color:#a855f7" title="Alternar entre Vista Rica con imágenes de Obsidian y Editor de texto">👁️ Vista Rica / Editar</button>
+                <button type="button" id="btn-pull-obsidian-notes" class="secondary-btn" style="padding:4px 10px;font-size:0.76rem" title="Traer ahora mismo cualquier texto o nota que hayas escrito en Obsidian para este libro">🔄 Traer de Obsidian</button>
+                <button type="button" id="btn-import-obsidian-md-file" class="secondary-btn" style="padding:4px 10px;font-size:0.76rem" title="Seleccionar un archivo .md de tu dispositivo para integrarlo con las notas de este libro">📂 Importar nota .md</button>
+                <input type="file" id="obsidian-md-file-input" accept=".md,.txt,text/markdown" hidden />
+              </div>
+            </div>
+            <small id="study-notes-sync-hint" class="clone-file-label" style="display:block;margin-bottom:6px;color:#a855f7">
+              🟣 Lo que escribas aquí se guarda directamente en tu bóveda de Obsidian, y lo que edites en Obsidian (incluyendo encabezados e imágenes <code>![[...]]</code>) aparece integrado aquí automáticamente.
+            </small>
+            <div id="study-book-notes-rich-view" class="obsidian-rich-notes-box hidden" style="padding:12px 14px;border-radius:10px;border:1px solid rgba(168,85,247,0.35);background:rgba(168,85,247,0.05);max-height:360px;overflow-y:auto;margin-bottom:8px;line-height:1.55;font-size:0.9rem"></div>
+            <textarea id="study-book-notes" class="text-input study-textarea" rows="7" placeholder="Escribe aquí tus impresiones generales, temas principales, citas o resumen del libro (sincronizado en ambos sentidos con tu nota de Obsidian)..."></textarea>
+          </div>
+
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
+            <small id="study-total-stats" class="clone-file-label" style="margin:0">Tiempo total registrado: 0 min en 0 sesiones</small>
+            <button id="btn-save-study-meta" class="primary-btn" style="padding:7px 14px;font-size:0.83rem">💾 Guardar y sincronizar con Obsidian</button>
+          </div>
+
+          <hr class="study-divider" />
+
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
+            <h3 style="font-size:0.95rem">⏱️ Registro de Sesiones de Lectura</h3>
+            <button id="btn-add-manual-session" class="secondary-btn" style="padding:5px 11px;font-size:0.78rem">+ Registrar sesión manual</button>
+          </div>
+          <p class="clone-help" style="margin-bottom:10px">
+            Las sesiones se registran automáticamente mientras lees o escuchas el libro, y también puedes añadir o borrar sesiones manualmente.
+          </p>
+          <div id="study-sessions-list" class="study-items-list"></div>
+        </div>
+
+        <!-- PESTAÑA 2: PASAJES RESALTADOS Y NOTAS -->
+        <div id="study-pane-highlights" class="study-pane hidden">
+          <p class="clone-help" style="margin-bottom:10px">
+            💡 <strong>Cómo resaltar:</strong> Selecciona cualquier frase o párrafo con el ratón en el lector y elige un color (🟡 🟢 🔵 🩷) o pulsa <strong>«📝 + Nota»</strong> en la barra flotante.
+          </p>
+          <div id="study-highlights-list" class="study-items-list"></div>
+        </div>
+
+        <!-- PESTAÑA 3: VOCABULARIO SUBRAYADO -->
+        <div id="study-pane-vocab" class="study-pane hidden">
+          <p class="clone-help" style="margin-bottom:10px">
+            💡 <strong>Cómo subrayar palabras:</strong> Haz clic derecho sobre cualquier palabra en el lector. Se subrayará en el texto y se guardará aquí con su traducción, fonética y frase de contexto.
+          </p>
+          <div id="study-vocab-list" class="study-items-list"></div>
+        </div>
+
+        <!-- PESTAÑA 4: CONEXIÓN BIDIRECCIONAL Y EDITOR OBSIDIAN (.MD) -->
+        <div id="study-pane-obsidian" class="study-pane hidden">
+          <div class="study-item-card" style="margin-bottom:12px;border-color:rgba(168,85,247,0.35)">
+            <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+              <strong style="font-size:0.92rem;color:#a855f7">🟣 Conexión Directa con tu Bóveda de Obsidian</strong>
+              <span id="obsidian-vault-active-path" class="badge-pill" style="font-size:0.75rem">Bóveda: Personal</span>
+            </div>
+            <div class="study-meta-grid" style="grid-template-columns:repeat(auto-fit, minmax(210px, 1fr));gap:10px">
+              <div class="study-field">
+                <label for="obsidian-vault-select">Bóveda de Obsidian activa</label>
+                <select id="obsidian-vault-select" class="player-select" style="max-width:none;width:100%;padding:6px 10px"></select>
+              </div>
+              <div class="study-field">
+                <label for="obsidian-subfolder-input">Subcarpeta para libros en la bóveda</label>
+                <input type="text" id="obsidian-subfolder-input" class="text-input" placeholder="Ej: Libros (vacío = raíz)" value="Libros" style="min-width:0;width:100%" />
+              </div>
+              <div class="study-field">
+                <label for="obsidian-link-file-select">Archivo .md vinculado a este libro en tu bóveda</label>
+                <input type="text" id="obsidian-link-file-select" list="obsidian-vault-files-datalist" class="text-input" placeholder="Ej: Libros/Título.md" style="min-width:0;width:100%" />
+                <datalist id="obsidian-vault-files-datalist"></datalist>
+              </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;flex-wrap:wrap;gap:8px">
+              <small class="clone-help" style="margin:0">
+                Puedes elegir cualquier nota <code>.md</code> existente de tu bóveda para integrarla con este libro, o dejar que VozLectura la cree y sincronice sola.
+              </small>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <button type="button" id="btn-save-obsidian-config" class="secondary-btn" style="padding:6px 12px;font-size:0.8rem">🔗 Guardar bóveda y vincular nota</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="obsidian-actions-bar">
+            <div>
+              <strong style="font-size:0.9rem">Editor Markdown Bidireccional (.md)</strong>
+              <p class="clone-help" style="margin:2px 0 0">
+                Puedes editar la nota completa aquí mismo o directamente en Obsidian. Al pulsar <strong>«💾 Guardar e integrar Markdown»</strong>, tus cambios se aplican al libro y a tu archivo en Obsidian.
+              </p>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="btn-save-obsidian-raw-md" class="primary-btn" style="padding:7px 14px;font-size:0.82rem;background:#9333ea">💾 Guardar e integrar Markdown</button>
+              <button id="btn-copy-obsidian-md" class="secondary-btn" style="padding:7px 12px;font-size:0.82rem">📋 Copiar</button>
+              <button id="btn-download-obsidian-md" class="secondary-btn" style="padding:7px 12px;font-size:0.82rem">⬇️ Descargar .md</button>
+            </div>
+          </div>
+          <textarea id="study-obsidian-preview" class="text-input obsidian-preview-area"></textarea>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: MODO SIN CONEXIÓN (OFFLINE) EN EL DISPOSITIVO Y SEGUNDO PLANO ANDROID -->
+  <div id="offline-modal" class="modal-backdrop hidden">
+    <div class="modal-card" style="max-width:760px">
+      <div class="modal-header">
+        <div>
+          <h2>📲 Libros en Local (Modo Sin Conexión) y Pantalla Apagada en Android</h2>
+          <p class="modal-subtitle">
+            Guarda tus libros (texto y audio IA) dentro de la memoria del navegador de tu teléfono para usar la aplicación aunque no estés conectado al servidor.
+          </p>
+        </div>
+        <button id="btn-close-offline" class="icon-btn">✕</button>
+      </div>
+
+      <div class="clone-voice-panel">
+        <h3>📥 Descargar libro a la memoria local de este dispositivo</h3>
+        <p class="clone-help">
+          Puedes bajar <strong>solo el texto del EPUB</strong> (ocupa ~1–2 MB, instantáneo) o incluir también el <strong>audio neuronal de los capítulos</strong> para escucharlo sin conexión.
+        </p>
+
+        <div class="clone-form-row" style="margin-bottom:8px">
+          <select id="offline-book-select" class="player-select" style="flex:1;min-width:220px;max-width:none"></select>
+        </div>
+
+        <div class="clone-form-row" style="margin-bottom:8px">
+          <select id="offline-mode-select" class="player-select" style="flex:1;min-width:220px;max-width:none">
+            <option value="audio_all" selected>🎧 Texto + Audio IA de TODOS los capítulos del libro (Predeterminado)</option>
+            <option value="audio_next_5">🎧 Texto + Audio IA de los próximos 5 capítulos</option>
+            <option value="audio_next_3">🎧 Texto + Audio IA de los próximos 3 capítulos</option>
+            <option value="text_only">📖 Solo Texto y Notas del libro (Instantáneo, ~1-2 MB)</option>
+          </select>
+        </div>
+
+        <div id="offline-voice-row" class="clone-form-row" style="margin-bottom:8px">
+          <select id="offline-voice-select" class="player-select" style="flex:1;min-width:200px;max-width:none"></select>
+          <select id="offline-speed-select" class="player-select">
+            <option value="0.9">0.90×</option>
+            <option value="1.0" selected>1.00×</option>
+            <option value="1.15">1.15×</option>
+            <option value="1.25">1.25×</option>
+          </select>
+        </div>
+
+        <!-- Opción automática cuando el libro seleccionado forma parte de una pareja bilingüe EN/ES -->
+        <div id="offline-paired-option-box" class="offline-paired-option-box hidden">
+          <label class="toggle-row" style="margin-bottom:6px">
+            <input type="checkbox" id="chk-offline-include-partner" checked />
+            <span id="offline-paired-checkbox-label"><strong>🔗 Descargar también su libro pareja bilingüe a la vez</strong></span>
+          </label>
+          <div id="offline-partner-voice-row" class="clone-form-row" style="margin-top:4px">
+            <small style="color:var(--text-secondary);white-space:nowrap">Voz pareja:</small>
+            <select id="offline-partner-voice-select" class="player-select" style="flex:1;min-width:180px;max-width:none;font-size:0.82rem;padding:5px 8px"></select>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+          <div>
+            <input type="file" id="vozbook-file-input" accept=".vozbook,.json" hidden />
+            <button id="btn-import-vozbook" class="secondary-btn" style="padding:7px 12px;font-size:0.8rem">📂 Importar archivo .vozbook del teléfono</button>
+          </div>
+          <button id="btn-start-offline-dl" class="primary-btn">📲 Guardar en este dispositivo</button>
+        </div>
+
+        <div id="offline-dl-box" class="export-job-box hidden">
+          <div class="export-job-header">
+            <span id="offline-dl-phase">Guardando en memoria local...</span>
+            <strong id="offline-dl-pct">0%</strong>
+          </div>
+          <div class="export-bar-bg">
+            <div id="offline-dl-bar" class="export-bar-fill" style="width:0%"></div>
+          </div>
+          <div class="export-job-footer" style="flex-wrap:wrap;gap:8px">
+            <small id="offline-dl-detail">Preparando...</small>
+            <div style="display:flex;gap:6px;align-items:center">
+              <span id="offline-wakelock-badge" class="badge-pill" style="font-size:0.72rem;color:#16a34a;border-color:#16a34a">🔆 Pantalla mantenida activa</span>
+              <button id="btn-cancel-offline-dl" class="secondary-btn" style="padding:4px 10px;font-size:0.78rem">⏸ Pausar (guarda progreso)</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="offline-books-list" class="models-list">
+        <!-- Lista de libros guardados en IndexedDB del dispositivo -->
+      </div>
+
+      <!-- Panel plegable discreto con instrucciones por navegador (Brave, Chrome, Edge, Firefox) e IP del servidor -->
+      <details id="offline-advanced-details" class="clone-voice-panel" style="border-top:1px solid var(--border-color);border-bottom:none">
+        <summary style="cursor:pointer;font-weight:600;font-size:0.9rem;display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;list-style:none">
+          <span>⚙️ Configuración: Modo App sin servidor (Brave / Chrome / Firefox / Edge) e IP Wi-Fi</span>
+          <span id="sw-status-badge" class="badge-pill">Comprobando...</span>
+        </summary>
+
+        <div style="margin-top:12px;display:flex;flex-direction:column;gap:14px">
+          <div id="sw-offline-setup-panel" style="background:rgba(245,158,11,0.06);border:1px solid rgba(245,158,11,0.3);border-radius:10px;padding:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+              <strong style="font-size:0.88rem">🛡️ 1. Activar Modo App Sin Servidor según tu navegador</strong>
+              <button id="btn-install-pwa-app" class="primary-btn hidden" style="padding:5px 11px;font-size:0.76rem;background:#16a34a">📲 Instalar App en inicio</button>
+            </div>
+            <p id="sw-status-desc" class="clone-help" style="margin-bottom:10px">
+              Cuando entras por una IP local (<code>http://192.168.x.x</code>), los navegadores desactivan por defecto el guardado permanente de la aplicación (<code>Service Worker</code>) salvo que autorices la dirección local una sola vez. Elige tu navegador:
+            </p>
+
+            <!-- Selector de navegador -->
+            <div id="browser-guide-tabs" style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px">
+              <button type="button" class="secondary-btn browser-guide-tab active" data-browser="brave" style="padding:5px 10px;font-size:0.78rem">🦁 Brave</button>
+              <button type="button" class="secondary-btn browser-guide-tab" data-browser="chrome" style="padding:5px 10px;font-size:0.78rem">🌐 Chrome</button>
+              <button type="button" class="secondary-btn browser-guide-tab" data-browser="edge" style="padding:5px 10px;font-size:0.78rem">🌊 Edge</button>
+              <button type="button" class="secondary-btn browser-guide-tab" data-browser="firefox" style="padding:5px 10px;font-size:0.78rem">🦊 Firefox</button>
+              <button type="button" class="secondary-btn browser-guide-tab" data-browser="other" style="padding:5px 10px;font-size:0.78rem">🧭 Vivaldi / Opera / Samsung</button>
+            </div>
+
+            <div id="sw-activate-steps-box" style="font-size:0.82rem;line-height:1.48;margin-bottom:10px">
+              <div id="browser-guide-content">
+                <!-- Rellenado dinámicamente según el navegador elegido -->
+              </div>
+            </div>
+
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="btn-copy-app-origin" class="primary-btn" style="padding:6px 12px;font-size:0.78rem">📋 1. Copiar dirección de esta App</button>
+              <button id="btn-copy-chrome-flag" class="secondary-btn" style="padding:6px 12px;font-size:0.78rem;border-color:#f59e0b;font-weight:600">📋 2. Copiar enlace brave://flags</button>
+            </div>
+          </div>
+
+          <div style="border:1px solid var(--border-color);border-radius:10px;padding:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px">
+              <strong style="font-size:0.88rem">🌐 2. IP del Servidor en tu Wi-Fi (Sin perder tus libros locales)</strong>
+              <span id="server-conn-badge" class="badge-pill" style="color:#16a34a;border-color:#16a34a">Conectado</span>
+            </div>
+            <p class="clone-help" style="margin-bottom:8px">
+              Si tu ordenador cambia de IP en el Wi-Fi, <strong>no cambies la dirección arriba en el navegador</strong>: abre siempre el mismo marcador/icono y busca o indica la nueva IP aquí:
+            </p>
+            <div class="clone-form-row" style="gap:8px;flex-wrap:wrap">
+              <input type="text" id="offline-server-url-input" class="text-input" placeholder="Ej: http://192.168.1.50:8085" style="flex:1;min-width:190px" />
+              <button id="btn-save-server-url" class="primary-btn" style="padding:7px 12px;font-size:0.8rem">💾 Conectar IP</button>
+              <button id="btn-scan-server-ip" class="secondary-btn" style="padding:7px 12px;font-size:0.8rem;border-color:var(--accent);font-weight:600">🔍 Buscar IP en Wi-Fi</button>
+            </div>
+            <small id="server-scan-status" class="clone-file-label" style="display:block;margin-top:6px"></small>
+          </div>
+
+          <div style="border:1px solid var(--border-color);border-radius:10px;padding:12px">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:4px">
+              <strong style="font-size:0.88rem">🔒 3. Reproducción continua con pantalla apagada</strong>
+              <span class="badge-pill" style="color:#16a34a;border-color:#16a34a">✓ Activo automáticamente</span>
+            </div>
+            <p class="clone-help" style="margin-bottom:0">
+              Al pulsar <strong>Play</strong>, la app mantiene un puente de audio continuo (<code>MediaSession + Audio Keep-Alive + WakeLock</code>). <em>En Brave Android:</em> si quieres escuchar con pantalla apagada o en segundo plano, puedes activar también en Brave <code>Configuración → Multimedia → Reproducción en segundo plano</code>.
+            </p>
+          </div>
+        </div>
+      </details>
+    </div>
+  </div>
+
+  <!-- MODAL: CENTRO DE HÁBITOS, CALENDARIO, VALORACIONES Y ESTADÍSTICAS ANUALES -->
+  <div id="analytics-modal" class="modal-backdrop hidden">
+    <div class="modal-card study-modal-card" style="max-width:960px">
+      <div class="modal-header">
+        <div>
+          <h2>📊 Hábitos de Lectura, Calendario y Estadísticas</h2>
+          <p class="modal-subtitle">
+            Seguimiento diario, semanal y mensual, ranking de libros valorados, estadísticas de autores/extensión y resumen anual lector.
+          </p>
+        </div>
+        <button id="btn-close-analytics" class="icon-btn">✕</button>
+      </div>
+
+      <!-- Pestañas del Centro de Estadísticas -->
+      <div class="study-tabs" id="analytics-tabs">
+        <button class="study-tab active" data-analytics-tab="calendar">📅 Calendario y Hábitos</button>
+        <button class="study-tab" data-analytics-tab="rankings">🏆 Valoraciones y Listados</button>
+        <button class="study-tab" data-analytics-tab="stats">📈 Autores y Extensión</button>
+        <button class="study-tab" data-analytics-tab="annual">🗓️ Resumen Anual</button>
+      </div>
+
+      <div class="study-body">
+        <!-- PESTAÑA 1: CALENDARIO Y HÁBITOS (DÍA, SEMANA, MES, RACHA) -->
+        <div id="analytics-pane-calendar" class="study-pane">
+          <div id="analytics-kpis-top" class="analytics-kpi-grid">
+            <!-- Tarjetas de Racha, Hoy, Esta Semana, Este Mes, Meta Diaria -->
+          </div>
+
+          <!-- Configuración rápida de Metas Lectoras -->
+          <details class="clone-voice-panel" style="padding:10px 14px;border-radius:10px;border:1px solid var(--border-color);margin-bottom:14px">
+            <summary style="cursor:pointer;font-weight:600;font-size:0.85rem;display:flex;justify-content:space-between;align-items:center">
+              <span>🎯 Configurar mis metas de lectura (Meta diaria de minutos y Reto anual de libros)</span>
+              <small style="color:var(--accent)">Editar metas ▾</small>
+            </summary>
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-top:10px">
+              <div class="pair-field-group" style="flex:1;min-width:140px">
+                <label class="popover-label">Meta diaria (minutos/día)</label>
+                <input type="number" id="goal-daily-minutes" class="text-input" min="5" max="600" value="30" style="width:100%" />
+              </div>
+              <div class="pair-field-group" style="flex:1;min-width:140px">
+                <label class="popover-label">Reto anual (libros/año)</label>
+                <input type="number" id="goal-yearly-books" class="text-input" min="1" max="300" value="12" style="width:100%" />
+              </div>
+              <div class="pair-field-group" style="flex:1;min-width:140px">
+                <label class="popover-label">Meta anual (páginas/año)</label>
+                <input type="number" id="goal-yearly-pages" class="text-input" min="100" max="200000" value="3600" style="width:100%" />
+              </div>
+              <button id="btn-save-reading-goals" class="primary-btn" style="padding:8px 14px;font-size:0.84rem">💾 Guardar metas</button>
+            </div>
+          </details>
+
+          <!-- Gráfico de los 7 días de la semana seleccionada -->
+          <div class="analytics-panel-card" style="margin-bottom:14px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+              <h3 style="margin:0;font-size:0.95rem">📊 Actividad de la Semana (<span id="analytics-week-label">Esta semana</span>)</h3>
+              <span id="analytics-week-total-badge" class="badge-pill">0 min</span>
+            </div>
+            <div id="analytics-week-bars" class="analytics-week-bars"></div>
+          </div>
+
+          <!-- Calendario Mensual Interactivo + Detalle del Día -->
+          <div class="analytics-calendar-layout">
+            <div class="analytics-panel-card">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:10px">
+                <button id="btn-cal-prev-month" class="secondary-btn" style="padding:5px 10px;font-size:0.82rem">◀ Mes ant.</button>
+                <div style="text-align:center">
+                  <strong id="analytics-cal-month-title" style="font-size:1rem">Noviembre 2026</strong>
+                  <div id="analytics-cal-month-summary" style="font-size:0.76rem;color:var(--text-secondary)">0 días leídos • 0 h</div>
+                </div>
+                <div style="display:flex;gap:6px">
+                  <button id="btn-cal-today" class="secondary-btn" style="padding:5px 9px;font-size:0.78rem">Hoy</button>
+                  <button id="btn-cal-next-month" class="secondary-btn" style="padding:5px 10px;font-size:0.82rem">Mes sig. ▶</button>
+                </div>
+              </div>
+
+              <div class="analytics-cal-weekdays">
+                <span>Lun</span><span>Mar</span><span>Mié</span><span>Jue</span><span>Vie</span><span>Sáb</span><span>Dom</span>
+              </div>
+              <div id="analytics-cal-grid" class="analytics-cal-grid"></div>
+            </div>
+
+            <!-- Panel lateral/inferior con lo leído en el día seleccionado -->
+            <div class="analytics-panel-card" id="analytics-day-detail-box">
+              <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+                <h3 id="analytics-selected-day-title" style="margin:0;font-size:0.95rem">📅 Detalle del día</h3>
+                <span id="analytics-selected-day-badge" class="badge-pill">0 min</span>
+              </div>
+              <div id="analytics-selected-day-content" style="display:flex;flex-direction:column;gap:8px;margin-bottom:12px"></div>
+
+              <!-- Registrar sesión manual en la fecha seleccionada -->
+              <div style="border-top:1px dashed var(--border-color);padding-top:10px;margin-top:auto">
+                <strong style="font-size:0.8rem;display:block;margin-bottom:6px">➕ Registrar lectura manual en esta fecha (<span id="analytics-quick-date-label">hoy</span>):</strong>
+                <div style="display:flex;gap:6px;flex-wrap:wrap">
+                  <select id="analytics-quick-book" class="player-select" style="flex:2;min-width:150px"></select>
+                  <input type="number" id="analytics-quick-mins" class="text-input" placeholder="Min" min="1" max="600" value="30" style="width:72px" title="Minutos leídos" />
+                  <input type="text" id="analytics-quick-note" class="text-input" placeholder="Capítulos o nota (opcional)" style="flex:2;min-width:140px" />
+                  <button id="btn-analytics-add-session" class="primary-btn" style="padding:6px 12px;font-size:0.8rem">Añadir</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- PESTAÑA 2: RANKING, VALORACIONES Y LISTADOS DE LIBROS -->
+        <div id="analytics-pane-rankings" class="study-pane hidden">
+          <div class="analytics-panel-card" style="margin-bottom:12px">
+            <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;justify-content:space-between">
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <select id="rank-filter-status" class="player-select">
+                  <option value="all">📚 Todos los estados</option>
+                  <option value="completed">✅ Terminados</option>
+                  <option value="reading">📖 Leyendo ahora</option>
+                  <option value="paused">⏸️ En pausa</option>
+                  <option value="wishlist">📌 Pendientes</option>
+                </select>
+                <select id="rank-filter-rating" class="player-select">
+                  <option value="all">⭐ Todas las valoraciones</option>
+                  <option value="5">⭐⭐⭐⭐⭐ Solo 5 estrellas</option>
+                  <option value="4.5plus">⭐⭐⭐⭐½ 4,5 o más estrellas</option>
+                  <option value="4plus">⭐⭐⭐⭐ 4 o más estrellas</option>
+                  <option value="3.5plus">⭐⭐⭐½ 3,5 o más estrellas</option>
+                  <option value="rated">Con valoración (0,5–5 ⭐)</option>
+                  <option value="unrated">Sin valorar aún</option>
+                </select>
+                <select id="rank-filter-lang" class="player-select">
+                  <option value="all">🌍 Todos los idiomas</option>
+                  <option value="es">🇪🇸 Español</option>
+                  <option value="en">🇬🇧 Inglés</option>
+                </select>
+                <select id="rank-sort-by" class="player-select">
+                  <option value="rating_desc">🏆 Ordenar: Mejor valorados</option>
+                  <option value="time_desc">⏱️ Ordenar: Más tiempo dedicado</option>
+                  <option value="length_desc">📏 Ordenar: Más largos (páginas/palabras)</option>
+                  <option value="length_asc">📐 Ordenar: Más cortos</option>
+                  <option value="finished_desc">📅 Ordenar: Terminados más recientes</option>
+                  <option value="title_asc">🔤 Ordenar: Título (A-Z)</option>
+                </select>
+              </div>
+              <div style="display:flex;gap:6px;flex-wrap:wrap">
+                <button id="btn-export-rankings-md" class="secondary-btn" style="padding:6px 11px;font-size:0.78rem">📝 Exportar listado (.md Obsidian)</button>
+                <button id="btn-export-rankings-csv" class="secondary-btn" style="padding:6px 11px;font-size:0.78rem">📊 Exportar CSV (Excel)</button>
+              </div>
+            </div>
+          </div>
+
+          <div id="analytics-rankings-list" style="display:flex;flex-direction:column;gap:10px">
+            <!-- Listado interactivo de libros con cambio rápido de estrellas, estado y fechas -->
+          </div>
+        </div>
+
+        <!-- PESTAÑA 3: ESTADÍSTICAS DE EXTENSIÓN DE LIBROS Y AUTORES -->
+        <div id="analytics-pane-stats" class="study-pane hidden">
+          <div id="analytics-records-grid" class="analytics-kpi-grid" style="margin-bottom:14px">
+            <!-- Tarjetas de Autor más leído, Autor mejor valorado, Libro más largo, Libro más corto, Media de páginas -->
+          </div>
+
+          <div class="analytics-panel-card" style="margin-bottom:14px">
+            <h3 style="margin:0 0 10px 0;font-size:0.96rem">👨‍💼 Ranking de Autores (Tiempo leído, Libros, Páginas y Valoración media)</h3>
+            <div id="analytics-authors-list" style="display:flex;flex-direction:column;gap:8px"></div>
+          </div>
+
+          <div class="analytics-panel-card">
+            <h3 style="margin:0 0 10px 0;font-size:0.96rem">📏 Comparativa de Longitud de tus Libros (Páginas estimadas y Palabras)</h3>
+            <div id="analytics-length-bars" style="display:flex;flex-direction:column;gap:8px"></div>
+          </div>
+        </div>
+
+        <!-- PESTAÑA 4: RESUMEN ANUAL DE LECTURAS (TU AÑO LECTOR) -->
+        <div id="analytics-pane-annual" class="study-pane hidden">
+          <div class="analytics-panel-card" style="margin-bottom:14px">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+              <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+                <h3 style="margin:0;font-size:1.05rem">🗓️ Resumen de Lecturas del Año:</h3>
+                <select id="analytics-year-select" class="player-select" style="font-size:0.95rem;font-weight:700;padding:6px 14px"></select>
+              </div>
+              <button id="btn-export-annual-md" class="primary-btn" style="padding:7px 14px;font-size:0.82rem">
+                📥 Descargar Resumen Anual (.md Obsidian)
+              </button>
+            </div>
+          </div>
+
+          <div id="analytics-annual-content">
+            <!-- Renderizado dinámico del Reto Anual, KPIs del año, Gráfico de 12 meses, Podio del Año y Libros Terminados -->
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Notificación Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/i18n.js?v=1.0.0"></script>
+  <script src="/app.js?v=1.0.0"></script>
+</body>
+</html>

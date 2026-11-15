@@ -1,0 +1,29 @@
+# User data, EPUBs, cached audio, and downloaded models
+data/
+books/
+models/
+
+# Virtual environments & Python caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+
+# Build & portable distribution artifacts
+dist/
+build/
+bin/
+python/
+packaging_staging/
+*.zip
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+.env

@@ -1,0 +1,13 @@
+services:
+  vozlectura:
+    build: .
+    container_name: vozlectura
+    ports:
+      - "${VOZLECTURA_PORT:-8085}:8085"
+    volumes:
+      - ./data:/app/data
+      # Optional: mount your Obsidian vault folder to sync book study notes directly
+      # - /path/to/your/obsidian/vaults:/app/obsidian_vaults
+    environment:
+      - VOZLECTURA_DATA_DIR=/app/data
+    restart: unless-stopped
