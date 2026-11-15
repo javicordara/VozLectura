@@ -295,6 +295,231 @@
     "⚡ Añadir o iniciar conversión de un libro": "⚡ Add or start book conversion",
     "📲 Libros en Local (Modo Sin Conexión) y Pantalla Apagada en Android": "📲 Local Books (Offline Mode) & Background Playback on Android",
     "🎧 Sincronizar EPUB + Audiolibro (MP3 / M4B / M4A)": "🎧 Sync EPUB + Audiobook (MP3 / M4B / M4A)",
+
+    // Missing menus, dropdowns, buttons & tooltips from index.html / app.js
+    "VozLectura — Lector EPUB TTS (Piper & Kokoro)": "VozLectura — EPUB TTS Reader (Piper & Kokoro)",
+    "Índice de capítulos": "Table of contents",
+    "Añadir nuevo libro EPUB o Media Overlay": "Add new EPUB or Media Overlay book",
+    "Cuaderno de lectura, palabras subrayadas, pasajes resaltados y nota Markdown para Obsidian": "Reading notebook, underlined words, highlights, and Markdown note for Obsidian",
+    "Emparejar este libro con su versión en Inglés / Castellano": "Pair this book with its English / Spanish version",
+    "Sans-Serif": "Sans-Serif",
+    "Total": "Full",
+    "⚡ Rápido (Solo recorte de silencios)": "⚡ Fast (Silence trimming only)",
+    "🔍 Vincular Bluetooth": "🔍 Pair Bluetooth",
+    "Permite al navegador leer el nombre del Bluetooth conectado para activar los recortes automáticamente en el coche": "Allows the browser to read the connected Bluetooth name to auto-enable trimming in the car",
+    "Nombre Bluetooth de tu coche (ej: SEAT, Kia, My Car...)": "Your car's Bluetooth name (e.g. SEAT, Kia, My Car...)",
+    "Subiendo archivo EPUB...": "Uploading EPUB file...",
+    "Modo Sin Conexión Activo — Mostrando tus libros guardados en este dispositivo": "Offline Mode Active — Showing books saved on this device",
+    "Puedes leer y escuchar tus libros locales sin conexión. Si tu ordenador cambió de IP en el Wi-Fi, pulsa «Buscar nueva IP del servidor».": "You can read and listen to your local books offline. If your PC's Wi-Fi IP changed, click «Find new server IP».",
+    "🔍 Buscar nueva IP del servidor": "🔍 Find new server IP",
+    "📲 Mis libros locales": "📲 My local books",
+    "Conversión en curso...": "Conversion in progress...",
+    "Codificando frases en segundo plano": "Encoding sentences in background",
+    "Ver cola de conversión": "View conversion queue",
+    "Cargar archivo .epub (normal o EPUB 3 Media Overlay)": "Load .epub file (standard or EPUB 3 Media Overlay)",
+    "Sincronizar un EPUB con su Audiolibro MP3 / M4B / M4A": "Sync an EPUB with its MP3 / M4B / M4A Audiobook",
+    "Abrir Calendario de Hábitos y Estadísticas": "Open Habits Calendar & Stats",
+    "Abrir Cola de conversión de ficheros": "Open File Export Queue",
+    "Mostrar u ocultar buscador, filtros y ordenación": "Show or hide search, filters, and sorting",
+    "Buscar por título, autor o género...": "Search by title, author, or genre...",
+    "🕒 Tiempo desde última lectura": "🕒 Time since last read",
+    "📥 Fecha de adición": "📥 Date added",
+    "⭐ Nota / Valoración": "⭐ Rating",
+    "📄 Nº de páginas": "📄 Page count",
+    "✍️ Autor": "✍️ Author",
+    "📅 Fecha de publicación": "📅 Publication date",
+    "🔤 Título": "🔤 Title",
+    "📈 % Leído": "📈 % Read",
+    "⬆️ Menor a mayor (Reciente 1º)": "⬆️ Ascending (Recent 1st)",
+    "⬇️ Mayor a menor (Antiguo 1º)": "⬇️ Descending (Oldest 1st)",
+    "Invertir orden Ascendente / Descendente": "Toggle Ascending / Descending order",
+    "↺ Limpiar": "↺ Clear",
+    "Limpiar todos los filtros activos": "Clear all active filters",
+    "🏷️ Tipo / Género": "🏷️ Type / Genre",
+    "📘 Estado de lectura": "📘 Reading status",
+    "✅ Terminado / Leído": "✅ Completed / Read",
+    "⭐ Valoración": "⭐ Rating",
+    "★★★★★ Solo 5 estrellas": "★★★★★ 5 stars only",
+    "★★★★½ 4,5 estrellas o más": "★★★★½ 4.5 stars or more",
+    "★★★½☆ 3,5 estrellas o más": "★★★½☆ 3.5 stars or more",
+    "🔄 Ir a versión ES": "🔄 Switch to ES",
+    "🔄 Ir a versión ES 🇪🇸": "🔄 Switch to ES 🇪🇸",
+    "🔄 Ir a versión EN": "🔄 Switch to EN",
+    "🔄 Ir a versión EN 🇬🇧": "🔄 Switch to EN 🇬🇧",
+    "Saltar ahora mismo a este capítulo en la otra versión del libro": "Jump to this chapter in the other language version",
+    "📖 Paginado": "📖 Paginated",
+    "📜 Scroll": "📜 Scroll",
+    "Alternar entre Scroll infinito y Paginado por hojas": "Toggle between Infinite scroll and Paginated pages",
+    "🌙 Noche": "🌙 Dark",
+    "☀️ Claro": "☀️ Light",
+    "📜 Sepia": "📜 Sepia",
+    "Cambiar rápido entre Modo Noche, Sepia y Claro": "Quick switch between Dark, Sepia, and Light mode",
+    "⛶ Inmersivo": "⛶ Immersive",
+    "Modo inmersivo a pantalla completa sin barra superior": "Immersive fullscreen mode without top bar",
+    "⛶ Mostrar barra": "⛶ Show toolbar",
+    "Mostrar barra superior y controles": "Show top bar and controls",
+    "Hoja anterior (RePág)": "Previous page (PageUp)",
+    "Hoja siguiente (AvPág)": "Next page (PageDown)",
+    "Frase anterior (Flecha Izquierda)": "Previous sentence (Left Arrow)",
+    "Frase siguiente (Flecha Derecha)": "Next sentence (Right Arrow)",
+    "Porcentaje total leído del libro hasta la fecha": "Total book reading progress so far",
+    "Selecciona una frase del texto para comenzar la lectura en voz alta.": "Select any sentence in the text to start reading aloud.",
+    "Motor / Voz TTS": "TTS Engine / Voice",
+    "Velocidad": "Speed",
+    "Modo Coche (Recorte de pausas): Desactivado — Sonando tal cual se genera en la app. Pulsa para activar/desactivar.": "Car Mode (Pause trimming): Off — Playing as generated. Click to toggle.",
+    "Modo Coche ACTIVO (Recortes de pausas activados). Pulsa para volver al audio original sin recortes.": "Car Mode ON (Pause trimming enabled). Click to return to standard audio.",
+    "Modo Normal ACTIVO (Audiolibro tal cual se genera en la app, sin recortes). Pulsa para activar los recortes de Modo Coche.": "Normal Mode ON (Standard audio, no trimming). Click to enable Car Mode trimming.",
+    "🚗 Modo Coche fijado manualmente (Recortes activos)": "🚗 Car Mode manually locked (Trimming on)",
+    "📖 Modo Normal fijado manualmente (Sin recortes)": "📖 Normal Mode manually locked (No trimming)",
+
+    // Modals: Export Queue & Sync Audiobook
+    "Libro a convertir": "Book to convert",
+    "Generar Audiolibro": "Generate Audiobook",
+    "Generar": "Generate",
+    "Mostrar solo del libro seleccionado arriba": "Show only for the book selected above",
+    "🎧 Sincronizar audiolibro externo (MP3 / M4B / M4A)...": "🎧 Sync external audiobook (MP3 / M4B / M4A)...",
+    "Codificando...": "Encoding...",
+    "🗑 Cancelar y borrar": "🗑 Cancel and delete",
+    "1. ¿Con qué libro EPUB quieres sincronizar el audiolibro?": "1. Which EPUB book do you want to sync with the audiobook?",
+    "📖 Subir un archivo .epub nuevo desde mi dispositivo": "📖 Upload a new .epub file from my device",
+    "📚 Usar un libro que ya está en mi biblioteca": "📚 Use a book already in my library",
+    "📂 Seleccionar archivo .epub": "📂 Select .epub file",
+    "Ningún archivo .epub seleccionado": "No .epub file selected",
+    "2. Selecciona el audiolibro (.m4b, .m4a, .mp3, .wav, .ogg o .flac)": "2. Select the audiobook (.m4b, .m4a, .mp3, .wav, .ogg, or .flac)",
+    "🎵 Seleccionar archivo(s) de audio (.mp3 / .m4b / .m4a)": "🎵 Select audio file(s) (.mp3 / .m4b / .m4a)",
+    "Ningún archivo de audio seleccionado": "No audio file selected",
+    "3. Etiqueta de la pista de voz (opcional)": "3. Voice track label (optional)",
+    "Ej: 🎧 Audiolibro Original (Narrador Oficial)": "e.g. 🎧 Original Audiobook (Official Narrator)",
+    "Subiendo archivos al servidor...": "Uploading files to server...",
+    "🔄 Subir, Sincronizar Texto + Voz y Generar EPUB Media Overlay": "🔄 Upload, Sync Text + Voice & Generate EPUB Media Overlay",
+
+    // Bilingual pairing modal
+    "Libro actual:": "Current book:",
+    "✨ Auto-alinear por contenido": "✨ Auto-align by content",
+    "Analiza automáticamente el texto, nombres propios y longitud de cada capítulo para emparejarlos": "Automatically analyzes text, proper nouns, and chapter length to pair them",
+    "📐 Aplicar desfase desde aquí": "📐 Apply offset from here",
+    "Aplicar este mismo desfase a todos los capítulos siguientes a partir de este": "Apply this same offset to all subsequent chapters from here",
+    "Capítulo en este libro:": "Chapter in this book:",
+    "Equivale a este capítulo en la pareja:": "Matches this chapter in the paired book:",
+    "Capítulo anterior en la pareja": "Previous chapter in paired book",
+    "Capítulo siguiente en la pareja": "Next chapter in paired book",
+    "🗺️ Ver / ajustar mapa completo capítulo a capítulo": "🗺️ View / adjust full chapter-by-chapter map",
+
+    // Dictionary & Highlight popover
+    "Diccionario y traducción": "Dictionary and translation",
+    "Escuchar pronunciación": "Listen to pronunciation",
+    "Nota personal sobre esta palabra (opcional)...": "Personal note about this word (optional)...",
+    "🖍️ Subrayar palabra": "🖍️ Underline word",
+    "Subrayar esta palabra en el libro y guardarla en la nota de Obsidian": "Underline this word in the book and save it to the Obsidian note",
+    "📖 Diccionario": "📖 Dictionary",
+    "Resaltar pasaje o tomar nota": "Highlight passage or take note",
+    "Consultar palabra en el diccionario y traductor": "Look up word in dictionary and translator",
+    "Resaltar:": "Highlight:",
+    "Resaltar en amarillo": "Highlight in yellow",
+    "Resaltar en verde": "Highlight in green",
+    "Resaltar en azul": "Highlight in blue",
+    "Resaltar en rosa": "Highlight in pink",
+    "📝 + Nota": "📝 + Note",
+    "Resaltar este pasaje y escribir una nota para Obsidian": "Highlight this passage and write a note for Obsidian",
+
+    // Study & Obsidian modal
+    "Libro:": "Book:",
+    "🟣 Sincronización bidireccional con Obsidian activa": "🟣 Two-way Obsidian sync active",
+    "🔄 Sincronizar Obsidian": "🔄 Sync Obsidian",
+    "Leer cambios hechos en Obsidian y guardar cambios de la app en tu bóveda": "Read changes made in Obsidian and save app changes to your vault",
+    "🟣 Abrir en Obsidian": "🟣 Open in Obsidian",
+    "Abrir directamente esta nota en la aplicación Obsidian": "Open this note directly in the Obsidian app",
+    "⬇️ Descargar .md": "⬇️ Download .md",
+    "📊 Hábitos y Notas del Libro": "📊 Book Habits & Notes",
+    "🟣 Conexión y Editor Obsidian (.md)": "🟣 Obsidian Connection & Editor (.md)",
+    "Estado de lectura": "Reading status",
+    "📖 Leyendo actualmente": "📖 Currently reading",
+    "Fecha de inicio": "Start date",
+    "Fecha de finalización": "Completion date",
+    "Veces leído": "Times read",
+    "Valoración personal (Saltos de 0,5 ★)": "Personal rating (0.5 ★ steps)",
+    "— Sin puntuar —": "— Unrated —",
+    "🏷️ Tipo / Género del libro": "🏷️ Book Type / Genre",
+    "Ej: Terror, Ciencia ficción, Fantasía...": "e.g. Horror, Sci-Fi, Fantasy...",
+    "📅 Año / Fecha de publicación": "📅 Publication Year / Date",
+    "Ej: 2006 o 2006-05-12": "e.g. 2006 or 2006-05-12",
+    "Subrayar automáticamente palabras buscadas en el diccionario": "Automatically underline words looked up in the dictionary",
+    "📝 Notas del libro, resumen y apuntes integrados con Obsidian": "📝 Book notes, summary, and study notes synced with Obsidian",
+    "👁️ Vista Rica / Editar": "👁️ Rich View / Edit",
+    "Alternar entre Vista Rica con imágenes de Obsidian y Editor de texto": "Toggle between Rich View with Obsidian images and Text Editor",
+    "🔄 Traer de Obsidian": "🔄 Pull from Obsidian",
+    "Traer ahora mismo cualquier texto o nota que hayas escrito en Obsidian para este libro": "Pull any text or notes you wrote in Obsidian for this book right now",
+    "📂 Importar nota .md": "📂 Import .md note",
+    "Seleccionar un archivo .md de tu dispositivo para integrarlo con las notas de este libro": "Select an .md file from your device to merge with this book's notes",
+    "Escribe aquí tus impresiones generales, temas principales, citas o resumen del libro (sincronizado en ambos sentidos con tu nota de Obsidian)...": "Write your general impressions, main themes, quotes, or book summary here (two-way synced with your Obsidian note)...",
+    "💾 Guardar y sincronizar con Obsidian": "💾 Save & sync with Obsidian",
+    "⏱️ Registro de Sesiones de Lectura": "⏱️ Reading Sessions Log",
+    "+ Registrar sesión manual": "+ Log manual session",
+    "Las sesiones se registran automáticamente mientras lees o escuchas el libro, y también puedes añadir o borrar sesiones manualmente.": "Sessions are logged automatically while you read or listen, and you can also add or delete sessions manually.",
+    "🟣 Conexión Directa con tu Bóveda de Obsidian": "🟣 Direct Connection to your Obsidian Vault",
+    "Bóveda de Obsidian activa": "Active Obsidian vault",
+    "Subcarpeta para libros en la bóveda": "Subfolder for books in vault",
+    "Ej: Libros (vacío = raíz)": "e.g. Books (empty = root)",
+    "Archivo .md vinculado a este libro en tu bóveda": "Linked .md file for this book in your vault",
+    "Ej: Libros/Título.md": "e.g. Books/Title.md",
+    "🔗 Guardar bóveda y vincular nota": "🔗 Save vault & link note",
+    "Editor Markdown Bidireccional (.md)": "Two-Way Markdown Editor (.md)",
+    "💾 Guardar e integrar Markdown": "💾 Save & merge Markdown",
+    "📋 Copiar": "📋 Copy",
+
+    // Offline modal
+    "🔗 Descargar también su libro pareja bilingüe a la vez": "🔗 Also download its paired bilingual book",
+    "Voz pareja:": "Paired voice:",
+    "📂 Importar archivo .vozbook del teléfono": "📂 Import .vozbook file from device",
+    "📲 Guardar en este dispositivo": "📲 Save to this device",
+    "Guardando en memoria local...": "Saving to local storage...",
+    "Preparando...": "Preparing...",
+    "🔆 Pantalla mantenida activa": "🔆 Screen kept awake",
+    "⏸ Pausar (guarda progreso)": "⏸ Pause (saves progress)",
+    "⚙️ Configuración: Modo App sin servidor (Brave / Chrome / Firefox / Edge) e IP Wi-Fi": "⚙️ Settings: Offline App Mode (Brave / Chrome / Firefox / Edge) & Wi-Fi IP",
+    "Comprobando...": "Checking...",
+    "🛡️ 1. Activar Modo App Sin Servidor según tu navegador": "🛡️ 1. Enable Offline App Mode for your browser",
+    "📲 Instalar App en inicio": "📲 Install App to Home Screen",
+    "📋 1. Copiar dirección de esta App": "📋 1. Copy this App's URL",
+    "📋 2. Copiar enlace brave://flags": "📋 2. Copy brave://flags link",
+    "🌐 2. IP del Servidor en tu Wi-Fi (Sin perder tus libros locales)": "🌐 2. Server Wi-Fi IP (Without losing local books)",
+    "Ej: http://192.168.1.50:8085": "e.g. http://192.168.1.50:8085",
+    "🔒 3. Reproducción continua con pantalla apagada": "🔒 3. Continuous playback with screen off",
+    "✓ Activo automáticamente": "✓ Automatically active",
+
+    // Habits & Analytics modal
+    "Seguimiento diario, semanal y mensual, ranking de libros valorados, estadísticas de autores/extensión y resumen anual lector.": "Daily, weekly, and monthly tracking, top-rated books, author/length stats, and annual reading summary.",
+    "🎯 Configurar mis metas de lectura (Meta diaria de minutos y Reto anual de libros)": "🎯 Configure reading goals (Daily minutes & Annual book challenge)",
+    "Editar metas ▾": "Edit goals ▾",
+    "Meta diaria (minutos/día)": "Daily goal (minutes/day)",
+    "Reto anual (libros/año)": "Annual challenge (books/year)",
+    "Meta anual (páginas/año)": "Annual goal (pages/year)",
+    "💾 Guardar metas": "💾 Save goals",
+    "Esta semana": "This week",
+    "◀ Mes ant.": "◀ Prev month",
+    "Hoy": "Today",
+    "Mes sig. ▶": "Next month ▶",
+    "Lun": "Mon",
+    "Mar": "Tue",
+    "Mié": "Wed",
+    "Jue": "Thu",
+    "Vie": "Fri",
+    "Sáb": "Sat",
+    "Dom": "Sun",
+    "📅 Detalle del día": "📅 Day details",
+    "hoy": "today",
+    "Min": "Min",
+    "Minutos leídos": "Minutes read",
+    "Capítulos o nota (opcional)": "Chapters or note (optional)",
+    "Añadir": "Add",
+    "⏸️ En pausa": "⏸️ Paused",
+    "📌 Pendientes": "📌 To read",
+    "📝 Exportar listado (.md Obsidian)": "📝 Export list (.md Obsidian)",
+    "📊 Exportar CSV (Excel)": "📊 Export CSV (Excel)",
+    "👨‍💼 Ranking de Autores (Tiempo leído, Libros, Páginas y Valoración media)": "👨‍💼 Author Ranking (Time read, Books, Pages & Avg rating)",
+    "📏 Comparativa de Longitud de tus Libros (Páginas estimadas y Palabras)": "📏 Book Length Comparison (Estimated pages & Words)",
+    "🗓️ Resumen de Lecturas del Año:": "🗓️ Annual Reading Summary:",
+    "📥 Descargar Resumen Anual (.md Obsidian)": "📥 Download Annual Summary (.md Obsidian)",
   };
 
   const REGEX_ES_TO_EN = [
@@ -326,6 +551,14 @@
     [/^📘\s*([^%]+%)\s*del libro leído\s*\(Cap\.\s*(\d+)\s*de\s*(\d+)\)$/i, "📘 $1 of book read (Ch. $2 of $3)"],
     [/^Hoja (\d+) \/ (\d+)$/i, "Page $1 / $2"],
     [/^Hoja (\d+) de (\d+) • 📘 ([^%]+%) leído$/i, "Page $1 of $2 • 📘 $3 read"],
+    [/^📘 (\d+(?:[.,]\d+)?%) del libro leído$/i, "📘 $1 of book read"],
+    [/^📘 Libro: (\d+(?:[.,]\d+)?%) leído$/i, "📘 Book: $1 read"],
+    [/^(\d+) fr\.$/i, "$1 sent."],
+    [/^(\d+) emparejados$/i, "$1 paired"],
+    [/^Tiempo total registrado: (\d+) min en (\d+) sesiones?$/i, (_, m, s) => `Total logged time: ${m} min in ${s} ${s === "1" ? "session" : "sessions"}`],
+    [/^Bóveda: (.+)$/i, "Vault: $1"],
+    [/^(\d+) días? leídos? • (.+)$/i, (_, d, h) => `${d} ${d === "1" ? "day" : "days"} read • ${h}`],
+    [/^Desfase de capítulos: (-?\d+) \(mismo número de capítulo\)$/i, "Chapter offset: $1 (same chapter number)"],
     [/^Archivo seleccionado: (.+)$/i, "Selected file: $1"],
     [/^Modo CPU \((.+)\)$/, "CPU Mode ($1)"],
     [/^✓ Conectado \((.+)\)$/, "✓ Connected ($1)"],
@@ -360,6 +593,7 @@
 
   const textOriginals = new WeakMap();
   const attrOriginals = new WeakMap();
+  const originalDocumentTitle = document.title;
   let isApplying = false;
 
   function detectInitialLang() {
@@ -419,7 +653,7 @@
 
   function processElementAttrs(el) {
     if (!el || el.nodeType !== Node.ELEMENT_NODE) return;
-    if (el.closest(NO_TRANSLATE_SELECTOR)) return;
+    if (el.tagName !== "TEXTAREA" && el.closest(NO_TRANSLATE_SELECTOR)) return;
 
     let map = attrOriginals.get(el);
     if (!map) {
@@ -487,11 +721,20 @@
     isApplying = true;
     try {
       document.documentElement.lang = currentLang;
+      if (originalDocumentTitle) {
+        document.title =
+          currentLang === "en"
+            ? translateStringToEn(originalDocumentTitle)
+            : originalDocumentTitle;
+      }
       if (document.body) {
         walkSubtree(document.body);
       }
       syncToggleButton();
     } finally {
+      if (typeof observer !== "undefined" && observer) {
+        observer.takeRecords();
+      }
       isApplying = false;
     }
   }
@@ -543,6 +786,7 @@
         }
       }
     } finally {
+      observer.takeRecords();
       isApplying = false;
     }
   });
