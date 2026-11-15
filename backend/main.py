@@ -401,30 +401,57 @@ def build_demo_epub_bytes(lang: str = "es") -> bytes:
     return buf.getvalue()
 
 
+DEMO_BOOKS_DIR = BASE_DIR / "backend" / "demo_books"
+
+
+def _seed_demo_book_entry(fname: str, demo_lang: str) -> Dict[str, Any]:
+    """Importa un EPUB demo desde backend/demo_books o usa el extracto integrado como respaldo."""
+    demo_path = DEMO_BOOKS_DIR / fname
+    if demo_path.exists():
+        epub_bytes = demo_path.read_bytes()
+    else:
+        epub_bytes = build_demo_epub_bytes(demo_lang)
+    book_meta = epub_parser.import_epub(epub_bytes, fname)
+    default_voice = (
+        "piper:es_ES-davefx-medium"
+        if book_meta["language"].startswith("es")
+        else "piper:en_GB-cori-medium"
+    )
+    book_meta["progress"] = {
+        "chapter_index": 0,
+        "sentence_index": 0,
+        "voice_id": default_voice,
+        "speed": 1.0,
+        "updated_at": int(time.time()),
+    }
+    return book_meta
+
+
 @app.on_event("startup")
 async def seed_demo_books_if_empty() -> None:
-    """Crea dos libros EPUB de demostración (uno en español y otro en inglés) si la biblioteca está vacía."""
+    """Siembra los 4 libros de dominio público (Quijote ES/EN y Sherlock ES/EN) ya emparejados si la biblioteca está vacía."""
     library = load_library()
     if not library:
         try:
-            for demo_lang, fname in [("es", "quijote_es.epub"), ("en", "sherlock_en.epub")]:
-                epub_bytes = build_demo_epub_bytes(demo_lang)
-                book_meta = epub_parser.import_epub(epub_bytes, fname)
-                default_voice = (
-                    "piper:es_ES-davefx-medium"
-                    if book_meta["language"].startswith("es")
-                    else "piper:en_GB-cori-medium"
+            demo_pairs = [
+                ("en", "quijote_en.epub", "es", "quijote_es.epub"),
+                ("en", "sherlock_en.epub", "es", "sherlock_es.epub"),
+            ]
+            for en_lang, en_fname, es_lang, es_fname in demo_pairs:
+                en_meta = _seed_demo_book_entry(en_fname, en_lang)
+                es_meta = _seed_demo_book_entry(es_fname, es_lang)
+                library[en_meta["id"]] = en_meta
+                library[es_meta["id"]] = es_meta
+                await asyncio.to_thread(
+                    _apply_book_pairing,
+                    library,
+                    en_meta["id"],
+                    es_meta["id"],
+                    primary_book_id=en_meta["id"],
+                    auto_switch_chapters=True,
                 )
-                book_meta["progress"] = {
-                    "chapter_index": 0,
-                    "sentence_index": 0,
-                    "voice_id": default_voice,
-                    "speed": 1.0,
-                    "updated_at": int(time.time()),
-                }
-                library[book_meta["id"]] = book_meta
             save_library(library)
-            logger.info("Libros EPUB de demostración (ES y EN) creados automáticamente.")
+            logger.info("Libros EPUB de demostración (Quijote ES/EN y Sherlock ES/EN) sembrados y emparejados.")
         except Exception as exc:
             logger.warning("No se pudieron crear los libros de demostración: %s", exc)
 
@@ -1193,6 +1220,85 @@ async def preview_book_pairing_endpoint(book_id: str, partner_id: str) -> Dict[s
     )
 
 
+def _apply_book_pairing(
+    library: Dict[str, Dict[str, Any]],
+    book_id: str,
+    partner_id: str,
+    primary_book_id: Optional[str] = None,
+    auto_switch_chapters: bool = True,
+    chapter_offset: Optional[int] = None,
+    chapter_map: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """Empareja dos libros en `library`, calcula su mapa de capítulos y persiste metadata.json."""
+    book_a = library[book_id]
+    old_partner_id = (book_a.get("pairing") or {}).get("paired_book_id")
+    if old_partner_id and old_partner_id != partner_id and old_partner_id in library:
+        library[old_partner_id]["pairing"] = None
+
+    book_b = library[partner_id]
+    old_b_partner = (book_b.get("pairing") or {}).get("paired_book_id")
+    if old_b_partner and old_b_partner != book_id and old_b_partner in library:
+        library[old_b_partner]["pairing"] = None
+
+    primary_id = primary_book_id
+    if primary_id not in (book_id, partner_id):
+        lang_a = (book_a.get("language") or "").lower()
+        lang_b = (book_b.get("language") or "").lower()
+        if lang_a.startswith("en") and not lang_b.startswith("en"):
+            primary_id = book_id
+        elif lang_b.startswith("en") and not lang_a.startswith("en"):
+            primary_id = partner_id
+        else:
+            primary_id = book_id
+
+    alignment = _compute_bilingual_chapter_alignment(book_id, partner_id, library)
+    forward_map: Dict[str, int] = dict(alignment.get("chapter_map") or {})
+    if chapter_map:
+        for k, v in chapter_map.items():
+            if v is not None and int(v) >= 0:
+                forward_map[str(k)] = int(v)
+            elif str(k) in forward_map and (v is None or int(v) < 0):
+                del forward_map[str(k)]
+
+    reverse_map: Dict[str, int] = {}
+    for k_str, tgt_val in forward_map.items():
+        try:
+            reverse_map[str(int(tgt_val))] = int(k_str)
+        except Exception:
+            pass
+
+    offset = int(chapter_offset if chapter_offset is not None else alignment.get("dominant_offset", 0))
+    book_a["pairing"] = {
+        "paired_book_id": book_b["id"],
+        "paired_book_title": book_b["title"],
+        "paired_book_lang": book_b.get("language", "es"),
+        "auto_switch_chapters": bool(auto_switch_chapters),
+        "primary_book_id": primary_id,
+        "chapter_offset": offset,
+        "chapter_map": forward_map,
+    }
+    book_b["pairing"] = {
+        "paired_book_id": book_a["id"],
+        "paired_book_title": book_a["title"],
+        "paired_book_lang": book_a.get("language", "en"),
+        "auto_switch_chapters": bool(auto_switch_chapters),
+        "primary_book_id": primary_id,
+        "chapter_offset": -offset,
+        "chapter_map": reverse_map,
+    }
+
+    for bid, b_obj in ((book_id, book_a), (partner_id, book_b)):
+        mpath = BOOKS_DIR / str(bid) / "metadata.json"
+        if mpath.exists():
+            try:
+                m = json.loads(mpath.read_text(encoding="utf-8"))
+                m["pairing"] = b_obj["pairing"]
+                mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+    return alignment
+
+
 @app.put("/api/books/{book_id}/pair")
 async def pair_books_endpoint(book_id: str, req: BookPairingRequest) -> Dict[str, Any]:
     library = load_library()
@@ -1224,77 +1330,18 @@ async def pair_books_endpoint(book_id: str, req: BookPairingRequest) -> Dict[str
     if req.paired_book_id not in library:
         raise HTTPException(status_code=404, detail="El libro pareja seleccionado no existe")
 
-    # Limpiar emparejamiento previo si cambió de pareja
-    if old_partner_id and old_partner_id != req.paired_book_id and old_partner_id in library:
-        library[old_partner_id]["pairing"] = None
-
-    book_b = library[req.paired_book_id]
-    old_b_partner = (book_b.get("pairing") or {}).get("paired_book_id")
-    if old_b_partner and old_b_partner != book_id and old_b_partner in library:
-        library[old_b_partner]["pairing"] = None
-
-    # Determinar qué libro se lee primero en cada capítulo (por defecto el libro en inglés)
-    primary_id = req.primary_book_id
-    if primary_id not in (book_id, req.paired_book_id):
-        lang_a = (book_a.get("language") or "").lower()
-        lang_b = (book_b.get("language") or "").lower()
-        if lang_a.startswith("en") and not lang_b.startswith("en"):
-            primary_id = book_id
-        elif lang_b.startswith("en") and not lang_a.startswith("en"):
-            primary_id = req.paired_book_id
-        else:
-            primary_id = book_id
-
-    # Calcular o usar el mapa capítulo a capítulo
     alignment = await asyncio.to_thread(
-        _compute_bilingual_chapter_alignment, book_id, req.paired_book_id, library
+        _apply_book_pairing,
+        library,
+        book_id,
+        req.paired_book_id,
+        primary_book_id=req.primary_book_id,
+        auto_switch_chapters=req.auto_switch_chapters,
+        chapter_offset=req.chapter_offset,
+        chapter_map=req.chapter_map,
     )
-    forward_map: Dict[str, int] = dict(alignment.get("chapter_map") or {})
-    if req.chapter_map:
-        for k, v in req.chapter_map.items():
-            if v is not None and int(v) >= 0:
-                forward_map[str(k)] = int(v)
-            elif str(k) in forward_map and (v is None or int(v) < 0):
-                del forward_map[str(k)]
-
-    reverse_map: Dict[str, int] = {}
-    for k_str, tgt_val in forward_map.items():
-        try:
-            reverse_map[str(int(tgt_val))] = int(k_str)
-        except Exception:
-            pass
-
-    offset = int(req.chapter_offset if req.chapter_offset is not None else alignment.get("dominant_offset", 0))
-    book_a["pairing"] = {
-        "paired_book_id": book_b["id"],
-        "paired_book_title": book_b["title"],
-        "paired_book_lang": book_b.get("language", "es"),
-        "auto_switch_chapters": bool(req.auto_switch_chapters),
-        "primary_book_id": primary_id,
-        "chapter_offset": offset,
-        "chapter_map": forward_map,
-    }
-    book_b["pairing"] = {
-        "paired_book_id": book_a["id"],
-        "paired_book_title": book_a["title"],
-        "paired_book_lang": book_a.get("language", "en"),
-        "auto_switch_chapters": bool(req.auto_switch_chapters),
-        "primary_book_id": primary_id,
-        "chapter_offset": -offset,
-        "chapter_map": reverse_map,
-    }
-
     save_library(library)
-    for bid, b_obj in ((book_id, book_a), (req.paired_book_id, book_b)):
-        mpath = BOOKS_DIR / str(bid) / "metadata.json"
-        if mpath.exists():
-            try:
-                m = json.loads(mpath.read_text(encoding="utf-8"))
-                m["pairing"] = b_obj["pairing"]
-                mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
-            except Exception:
-                pass
-    return {"book": book_a, "paired_book": book_b, "alignment": alignment}
+    return {"book": library[book_id], "paired_book": library[req.paired_book_id], "alignment": alignment}
 
 
 @app.post("/api/dictionary/lookup")
