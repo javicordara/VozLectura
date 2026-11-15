@@ -6,6 +6,10 @@
 
 **[Español más abajo ↓](#vozlectura-en-español)**
 
+| Library View | Synchronized Reader (Piper TTS / Media Overlay) |
+| :---: | :---: |
+| ![VozLectura Library](docs/screenshots/library.png) | ![VozLectura Reader](docs/screenshots/reader.png) |
+
 ---
 
 ## English Overview
