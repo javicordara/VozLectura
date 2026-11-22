@@ -1,10 +1,12 @@
 import hashlib
 import inspect
 import io
+import json
 import logging
 import os
 import subprocess
 import threading
+import time
 import urllib.request
 import wave
 from collections import OrderedDict
@@ -264,7 +266,9 @@ class TTSEngineManager:
         self._kokoro_instance: Optional[Any] = None
 
         self._lock = threading.Lock()
+        self._updates_lock = threading.Lock()
         self._download_locks: Dict[str, threading.Lock] = {}
+        self.updates_cache_file = self.models_dir / "tts_updates_cache.json"
         self.audio_cache = AudioLRUCache(max_items=200)
 
     def get_gpu_status(self) -> Dict[str, Any]:
@@ -597,3 +601,190 @@ class TTSEngineManager:
             wav_file.setframerate(sample_rate)
             wav_file.writeframes(b"\x00\x00" * num_samples)
         return wav_io.getvalue()
+
+    @staticmethod
+    def _parse_version_key(ver_str: Optional[str]) -> Tuple[Any, ...]:
+        """Convierte una versión semántica en clave comparable de forma segura."""
+        if not ver_str:
+            return ()
+        clean = str(ver_str).strip().lstrip("vV")
+        try:
+            from packaging.version import Version
+
+            return (1, Version(clean))
+        except Exception:
+            import re
+
+            parts = [int(p) for p in re.findall(r"\d+", clean.split("+")[0])]
+            return (0, tuple(parts))
+
+    @classmethod
+    def _is_newer_version(cls, installed: Optional[str], latest: Optional[str]) -> bool:
+        if not installed or not latest:
+            return False
+        if str(installed).strip() == str(latest).strip():
+            return False
+        try:
+            k_inst = cls._parse_version_key(installed)
+            k_lat = cls._parse_version_key(latest)
+            if k_inst and k_lat and k_inst[0] == k_lat[0]:
+                return bool(k_lat[1] > k_inst[1])
+        except Exception:
+            pass
+        return False
+
+    def check_engine_updates(self, force: bool = False, cache_ttl_sec: int = 86400) -> Dict[str, Any]:
+        """Comprueba si los motores TTS instalados (PyPI) tienen nuevas versiones estables."""
+        import importlib.metadata as importlib_metadata
+
+        engines_spec = [
+            {
+                "id": "piper",
+                "name": "Piper TTS",
+                "package": "piper-tts",
+                "description": "Motor neuronal ultrarrápido offline en CPU",
+            },
+            {
+                "id": "kokoro",
+                "name": "Kokoro ONNX",
+                "package": "kokoro-onnx",
+                "description": "Voces expresivas Kokoro 82M en ONNX",
+            },
+        ]
+
+        now_ts = int(time.time())
+        with self._updates_lock:
+            if not force and self.updates_cache_file.exists():
+                try:
+                    cached = json.loads(self.updates_cache_file.read_text(encoding="utf-8"))
+                    checked_at = int(cached.get("checked_at") or 0)
+                    allowed_ids = {s["id"] for s in engines_spec}
+                    cached_engines = [
+                        e for e in (cached.get("engines") or []) if isinstance(e, dict) and e.get("id") in allowed_ids
+                    ]
+                    if (
+                        checked_at > 0
+                        and (now_ts - checked_at) < cache_ttl_sec
+                        and len(cached_engines) == len(engines_spec)
+                    ):
+                        cached["engines"] = cached_engines
+                        installed_changed = False
+                        updates_cnt = 0
+                        for eng in cached["engines"]:
+                            pkg = eng.get("package", "")
+                            try:
+                                cur_v = importlib_metadata.version(pkg)
+                            except Exception:
+                                cur_v = None
+                            if cur_v != eng.get("installed_version"):
+                                installed_changed = True
+                                eng["installed_version"] = cur_v
+                                lat_v = eng.get("latest_version")
+                                if not cur_v:
+                                    eng["has_update"] = False
+                                    eng["status"] = "not_installed"
+                                elif lat_v:
+                                    eng["has_update"] = self._is_newer_version(cur_v, lat_v)
+                                    eng["status"] = "update_available" if eng["has_update"] else "up_to_date"
+                            if eng.get("has_update"):
+                                updates_cnt += 1
+                        cached["updates_count"] = updates_cnt
+                        cached["has_updates"] = updates_cnt > 0
+                        cached["from_cache"] = True
+                        if installed_changed:
+                            try:
+                                self.updates_cache_file.write_text(
+                                    json.dumps(cached, ensure_ascii=False, indent=2),
+                                    encoding="utf-8",
+                                )
+                            except Exception:
+                                pass
+                        return cached
+                except Exception:
+                    pass
+
+            results: List[Dict[str, Any]] = []
+            updates_count = 0
+            any_network_ok = False
+
+            for spec in engines_spec:
+                pkg = spec["package"]
+                try:
+                    installed_ver = importlib_metadata.version(pkg)
+                except Exception:
+                    installed_ver = None
+
+                latest_ver: Optional[str] = None
+                release_url = f"https://pypi.org/project/{pkg}/"
+                release_date: Optional[str] = None
+                err_msg: Optional[str] = None
+
+                try:
+                    req = urllib.request.Request(
+                        f"https://pypi.org/pypi/{pkg}/json",
+                        headers={
+                            "User-Agent": "VozLectura-TTS-Updater/1.0",
+                            "Accept": "application/json",
+                        },
+                    )
+                    with urllib.request.urlopen(req, timeout=4.5) as resp:
+                        payload = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    info = payload.get("info") or {}
+                    latest_ver = str(info.get("version") or "").strip() or None
+                    if latest_ver:
+                        release_url = f"https://pypi.org/project/{pkg}/{latest_ver}/"
+                        rels = (payload.get("releases") or {}).get(latest_ver) or []
+                        if rels and isinstance(rels[0], dict):
+                            upload_iso = str(rels[0].get("upload_time_iso_8601") or rels[0].get("upload_time") or "")
+                            if upload_iso:
+                                release_date = upload_iso[:10]
+                        any_network_ok = True
+                except Exception as exc:
+                    err_msg = str(exc)
+
+                if not installed_ver:
+                    has_upd = False
+                    status = "not_installed"
+                elif latest_ver:
+                    has_upd = self._is_newer_version(installed_ver, latest_ver)
+                    status = "update_available" if has_upd else "up_to_date"
+                else:
+                    has_upd = False
+                    status = "error"
+
+                if has_upd:
+                    updates_count += 1
+
+                results.append(
+                    {
+                        "id": spec["id"],
+                        "name": spec["name"],
+                        "package": pkg,
+                        "description": spec["description"],
+                        "installed_version": installed_ver,
+                        "latest_version": latest_ver,
+                        "has_update": has_upd,
+                        "status": status,
+                        "release_url": release_url,
+                        "release_date": release_date,
+                        "error": err_msg,
+                    }
+                )
+
+            out = {
+                "checked_at": now_ts,
+                "from_cache": False,
+                "network_ok": any_network_ok,
+                "has_updates": updates_count > 0,
+                "updates_count": updates_count,
+                "engines": results,
+            }
+            if any_network_ok:
+                try:
+                    self.updates_cache_file.write_text(
+                        json.dumps(out, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                except Exception as exc:
+                    logger.warning("No se pudo guardar caché de actualizaciones TTS: %s", exc)
+            return out

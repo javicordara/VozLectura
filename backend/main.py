@@ -44,11 +44,14 @@ DATA_DIR = Path(_env_data_dir).expanduser().resolve() if _env_data_dir else (BAS
 BOOKS_DIR = DATA_DIR / "books"
 MODELS_DIR = DATA_DIR / "models"
 LIBRARY_FILE = DATA_DIR / "library.json"
+ARCHIVED_BOOKS_FILE = DATA_DIR / "archived_books.json"
+ARCHIVED_COVERS_DIR = DATA_DIR / "archived_covers"
 FRONTEND_DIR = BASE_DIR / "frontend"
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 BOOKS_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
+ARCHIVED_COVERS_DIR.mkdir(parents=True, exist_ok=True)
 
 epub_parser = EpubParser(books_dir=BOOKS_DIR)
 tts_manager = TTSEngineManager(models_dir=MODELS_DIR)
@@ -59,7 +62,7 @@ study_store = BookStudyStore(data_dir=DATA_DIR, books_dir=BOOKS_DIR)
 app = FastAPI(
     title="VozLectura — EPUB Reader & Offline Neural Audiobooks",
     description="Servidor local de lectura de EPUB con resaltado sincronizado y síntesis de voz neuronal offline (Piper & Kokoro 82M) en español e inglés.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -88,7 +91,7 @@ async def allow_private_network_cors(request: Request, call_next):
     return response
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def _detect_local_lan_ip() -> str:
@@ -278,6 +281,22 @@ def load_library() -> Dict[str, Dict[str, Any]]:
 def save_library(library: Dict[str, Dict[str, Any]]) -> None:
     payload = json.dumps(library, ensure_ascii=False, indent=2)
     LIBRARY_FILE.write_text(payload, encoding="utf-8")
+
+
+def load_archived_books() -> Dict[str, Dict[str, Any]]:
+    if not ARCHIVED_BOOKS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(ARCHIVED_BOOKS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception as exc:
+        logger.warning("Error leyendo archived_books.json: %s", exc)
+        return {}
+
+
+def save_archived_books(archived: Dict[str, Dict[str, Any]]) -> None:
+    payload = json.dumps(archived, ensure_ascii=False, indent=2)
+    ARCHIVED_BOOKS_FILE.write_text(payload, encoding="utf-8")
 
 
 def build_demo_epub_bytes(lang: str = "es") -> bytes:
@@ -505,6 +524,37 @@ async def seed_demo_books_if_empty() -> None:
             )
 
     asyncio.create_task(_run_selftest())
+
+    async def _refresh_existing_books_images() -> None:
+        try:
+            lib = load_library()
+            changed = False
+            for bid, bmeta in list(lib.items()):
+                if bmeta.get("_images_refreshed_v2"):
+                    continue
+                res = await asyncio.to_thread(epub_parser.refresh_book_images_from_epub, bid)
+                bmeta["_images_refreshed_v2"] = True
+                if res.get("cover_url") and not bmeta.get("cover_url"):
+                    bmeta["cover_url"] = res["cover_url"]
+                mpath = BOOKS_DIR / bid / "metadata.json"
+                if mpath.exists():
+                    try:
+                        m = json.loads(mpath.read_text(encoding="utf-8"))
+                        m["_images_refreshed_v2"] = True
+                        if res.get("cover_url") and not m.get("cover_url"):
+                            m["cover_url"] = res["cover_url"]
+                        mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
+                changed = True
+                if res.get("updated_chapters", 0) > 0:
+                    logger.info("Imágenes actualizadas en %s (%d capítulos)", bmeta.get("title", bid), res["updated_chapters"])
+            if changed:
+                save_library(lib)
+        except Exception as exc:
+            logger.warning("Error actualizando imágenes de libros existentes: %s", exc)
+
+    asyncio.create_task(_refresh_existing_books_images())
     await asyncio.to_thread(audio_store.resume_interrupted_jobs)
 
 
@@ -613,6 +663,72 @@ def _ensure_completed_book_progress_100(book_id: str, book_entry: Dict[str, Any]
     return False
 
 
+def _merge_study_fields_into_book(
+    book_id: str, b: Dict[str, Any], study_data: Dict[str, Any], allow_progress_fix: bool = True
+) -> tuple[Dict[str, Any], bool]:
+    dirty = False
+    if allow_progress_fix and study_data.get("reading_status") == "completed":
+        if _ensure_completed_book_progress_100(book_id, b):
+            dirty = True
+    item = dict(b)
+    item["reading_status"] = study_data.get("reading_status") or "reading"
+    raw_rating = round(max(0.0, min(5.0, float(study_data.get("rating") or 0.0))) * 2.0) / 2.0
+    item["rating"] = int(raw_rating) if raw_rating.is_integer() else raw_rating
+    item["times_read"] = int(study_data.get("times_read") or 1)
+    item["started_at"] = study_data.get("started_at")
+    item["finished_at"] = study_data.get("finished_at")
+
+    if study_data.get("genre"):
+        item["genre"] = study_data["genre"]
+        genres_list = list(item.get("genres") or [])
+        for g_part in [x.strip() for x in study_data["genre"].split(",") if x.strip()]:
+            if g_part not in genres_list:
+                genres_list.insert(0, g_part)
+        item["genres"] = genres_list
+    else:
+        item["genre"] = item.get("genre") or (item.get("genres")[0] if item.get("genres") else "")
+        item["genres"] = item.get("genres") or ([item["genre"]] if item["genre"] else [])
+
+    if study_data.get("published_date"):
+        item["published_date"] = study_data["published_date"]
+        _, p_yr = epub_parser._parse_opf_publication_date(study_data["published_date"])
+        if p_yr:
+            item["published_year"] = p_yr
+
+    if study_data.get("author") and study_data["author"] != item.get("author"):
+        item["author"] = study_data["author"]
+
+    sessions_list = study_data.get("sessions") or []
+    latest_session_ts = max(
+        (int(s.get("ended_at") or s.get("started_at") or 0) for s in sessions_list),
+        default=0,
+    )
+    prog_obj = item.get("progress") or {}
+    prog_upd = int(prog_obj.get("last_read_at") or prog_obj.get("updated_at") or 0)
+    has_started_reading = (
+        int(prog_obj.get("chapter_index") or 0) > 0
+        or int(prog_obj.get("sentence_index") or 0) > 0
+        or latest_session_ts > 0
+    )
+    if item["reading_status"] == "completed":
+        finished_ts = int(study_data.get("finished_at") or 0)
+        last_read_at = max(finished_ts, latest_session_ts) if (finished_ts > 0 or latest_session_ts > 0) else prog_upd
+        if allow_progress_fix and prog_upd > last_read_at > 0 and isinstance(b.get("progress"), dict):
+            b["progress"]["last_read_at"] = last_read_at
+            b["progress"]["updated_at"] = last_read_at
+            prog_obj["last_read_at"] = last_read_at
+            prog_obj["updated_at"] = last_read_at
+            dirty = True
+    elif has_started_reading:
+        last_read_at = max(prog_upd, latest_session_ts)
+    else:
+        last_read_at = 0
+
+    item["last_read_at"] = last_read_at
+    item["updated_at"] = last_read_at
+    return item, dirty
+
+
 def _enrich_library_with_catalog_and_study() -> List[Dict[str, Any]]:
     library = load_library()
     dirty_lib = False
@@ -672,66 +788,22 @@ def _enrich_library_with_catalog_and_study() -> List[Dict[str, Any]]:
 
         # 4. Combinar datos de estudio (estado de lectura, nota/estrellas, género personalizado, fecha publicación)
         study_data = study_store.get_study_data(book_id, sync_obsidian=False)
-        if study_data.get("reading_status") == "completed":
-            if _ensure_completed_book_progress_100(book_id, b):
-                dirty_lib = True
-        item = dict(b)
-        item["reading_status"] = study_data.get("reading_status") or "reading"
-        raw_rating = round(max(0.0, min(5.0, float(study_data.get("rating") or 0.0))) * 2.0) / 2.0
-        item["rating"] = int(raw_rating) if raw_rating.is_integer() else raw_rating
-        item["times_read"] = int(study_data.get("times_read") or 1)
-        item["started_at"] = study_data.get("started_at")
-        item["finished_at"] = study_data.get("finished_at")
-
-        if study_data.get("genre"):
-            item["genre"] = study_data["genre"]
-            genres_list = list(item.get("genres") or [])
-            for g_part in [x.strip() for x in study_data["genre"].split(",") if x.strip()]:
-                if g_part not in genres_list:
-                    genres_list.insert(0, g_part)
-            item["genres"] = genres_list
-        else:
-            item["genre"] = item.get("genre") or (item.get("genres")[0] if item.get("genres") else "")
-            item["genres"] = item.get("genres") or ([item["genre"]] if item["genre"] else [])
-
-        if study_data.get("published_date"):
-            item["published_date"] = study_data["published_date"]
-            p_date, p_yr = epub_parser._parse_opf_publication_date(study_data["published_date"])
-            if p_yr:
-                item["published_year"] = p_yr
-
-        if study_data.get("author") and study_data["author"] != item.get("author"):
-            item["author"] = study_data["author"]
-
-        # 5. Calcular timestamp real de última lectura (last_read_at) para ordenar de menor a mayor tiempo transcurrido
-        sessions_list = study_data.get("sessions") or []
-        latest_session_ts = max(
-            (int(s.get("ended_at") or s.get("started_at") or 0) for s in sessions_list),
-            default=0,
-        )
-        prog_obj = item.get("progress") or {}
-        prog_upd = int(prog_obj.get("last_read_at") or prog_obj.get("updated_at") or 0)
-        has_started_reading = (
-            int(prog_obj.get("chapter_index") or 0) > 0
-            or int(prog_obj.get("sentence_index") or 0) > 0
-            or latest_session_ts > 0
-        )
-        if item["reading_status"] == "completed":
-            finished_ts = int(study_data.get("finished_at") or 0)
-            last_read_at = max(finished_ts, latest_session_ts) if (finished_ts > 0 or latest_session_ts > 0) else prog_upd
-            if prog_upd > last_read_at > 0 and isinstance(b.get("progress"), dict):
-                b["progress"]["last_read_at"] = last_read_at
-                b["progress"]["updated_at"] = last_read_at
-                prog_obj["last_read_at"] = last_read_at
-                prog_obj["updated_at"] = last_read_at
-                dirty_lib = True
-        elif has_started_reading:
-            last_read_at = max(prog_upd, latest_session_ts)
-        else:
-            last_read_at = 0
-
-        item["last_read_at"] = last_read_at
-        item["updated_at"] = last_read_at
+        if (
+            isinstance(pairing_obj, dict)
+            and pairing_obj.get("paired_book_id")
+            and not study_data.get("pairing_info")
+            and str(pairing_obj["paired_book_id"]) in library
+        ):
+            try:
+                study_store.sync_paired_books_obsidian(
+                    book_id, str(pairing_obj["paired_book_id"])
+                )
+                study_data = study_store.get_study_data(book_id, sync_obsidian=False)
+            except Exception:
+                pass
+        item, item_dirty = _merge_study_fields_into_book(book_id, b, study_data, allow_progress_fix=True)
+        if item_dirty:
+            dirty_lib = True
 
         books_out.append(item)
 
@@ -750,10 +822,64 @@ def _enrich_library_with_catalog_and_study() -> List[Dict[str, Any]]:
     return books_out
 
 
+def _enrich_archived_books_with_study(active_ids: set) -> List[Dict[str, Any]]:
+    archived = load_archived_books()
+    out: List[Dict[str, Any]] = []
+    for book_id, b in archived.items():
+        if book_id in active_ids or not isinstance(b, dict):
+            continue
+        study_data = study_store.get_study_data(book_id, sync_obsidian=False)
+        item, _ = _merge_study_fields_into_book(book_id, b, study_data, allow_progress_fix=False)
+        item["is_archived"] = True
+        item["pairing"] = None
+        if any(ARCHIVED_COVERS_DIR.glob(f"{book_id}.*")):
+            item["cover_url"] = f"/api/books/{book_id}/cover"
+        out.append(item)
+    out.sort(
+        key=lambda x: (
+            1 if int(x.get("last_read_at") or 0) > 0 else 0,
+            int(x.get("last_read_at") or 0),
+            int(x.get("archived_at") or x.get("added_at") or 0),
+        ),
+        reverse=True,
+    )
+    return out
+
+
 @app.get("/api/books")
 async def get_books() -> Dict[str, Any]:
     books_list = await asyncio.to_thread(_enrich_library_with_catalog_and_study)
-    return {"books": books_list}
+    active_ids = {b["id"] for b in books_list}
+    archived_list = await asyncio.to_thread(_enrich_archived_books_with_study, active_ids)
+    return {"books": books_list, "archived_books": archived_list}
+
+
+def _find_matching_archived_book_id(
+    archived: Dict[str, Dict[str, Any]], book_meta: Dict[str, Any]
+) -> Optional[str]:
+    bid = book_meta.get("id")
+    if bid and bid in archived:
+        return bid
+    title_norm = _strip_accents_lower(book_meta.get("title") or "")
+    author_norm = _strip_accents_lower(book_meta.get("author") or "")
+    lang_prefix = str(book_meta.get("language") or "es").lower()[:2]
+    if not title_norm:
+        return None
+    for arch_id, arch_b in archived.items():
+        if _strip_accents_lower(arch_b.get("title") or "") != title_norm:
+            continue
+        arch_author = _strip_accents_lower(arch_b.get("author") or "")
+        arch_lang = str(arch_b.get("language") or "es").lower()[:2]
+        author_matches = (
+            not author_norm
+            or not arch_author
+            or author_norm == arch_author
+            or author_norm in arch_author
+            or arch_author in author_norm
+        )
+        if author_matches or arch_lang == lang_prefix:
+            return arch_id
+    return None
 
 
 @app.post("/api/books/upload")
@@ -781,7 +907,51 @@ async def upload_book(
         ) from exc
 
     library = load_library()
+    archived_books = load_archived_books()
+    matched_arch_id = _find_matching_archived_book_id(archived_books, book_meta)
+    restored_from_archive = False
+    arch_entry: Optional[Dict[str, Any]] = None
+
+    if matched_arch_id:
+        arch_entry = archived_books.pop(matched_arch_id)
+        save_archived_books(archived_books)
+        restored_from_archive = True
+        if matched_arch_id != book_meta["id"]:
+            await asyncio.to_thread(study_store.migrate_book_id, matched_arch_id, book_meta["id"], book_meta)
+        if not book_meta.get("cover_url"):
+            for old_cov in ARCHIVED_COVERS_DIR.glob(f"{matched_arch_id}.*"):
+                dest_cov = BOOKS_DIR / book_meta["id"] / f"cover{old_cov.suffix}"
+                try:
+                    shutil.copy2(old_cov, dest_cov)
+                    book_meta["cover_url"] = f"/api/books/{book_meta['id']}/cover"
+                    break
+                except Exception:
+                    pass
+        for old_cov in ARCHIVED_COVERS_DIR.glob(f"{matched_arch_id}.*"):
+            try:
+                old_cov.unlink()
+            except Exception:
+                pass
+        if arch_entry.get("added_at"):
+            book_meta["added_at"] = arch_entry["added_at"]
+        if arch_entry.get("genre") and not book_meta.get("genre"):
+            book_meta["genre"] = arch_entry["genre"]
+        if arch_entry.get("genres") and not book_meta.get("genres"):
+            book_meta["genres"] = arch_entry["genres"]
+        if arch_entry.get("published_date") and not book_meta.get("published_date"):
+            book_meta["published_date"] = arch_entry["published_date"]
+        if arch_entry.get("published_year") and not book_meta.get("published_year"):
+            book_meta["published_year"] = arch_entry["published_year"]
+
     existing_progress = library.get(book_meta["id"], {}).get("progress")
+    if not existing_progress and arch_entry:
+        arch_prog = arch_entry.get("progress")
+        if isinstance(arch_prog, dict) and (
+            matched_arch_id == book_meta["id"]
+            or int(arch_entry.get("chapter_count") or 0) == int(book_meta.get("chapter_count") or 0)
+        ):
+            existing_progress = dict(arch_prog)
+
     if book_meta.get("has_embedded_media_overlay"):
         default_voice = "audiobook:original"
     else:
@@ -801,13 +971,16 @@ async def upload_book(
         "last_read_at": 0,
     }
     library[book_meta["id"]] = book_meta
-    save_library(library)
 
     # Inicializar cuaderno de lectura, sincronizar nota en Obsidian y extraer mapas/ilustraciones del EPUB automáticamente
     try:
-        await asyncio.to_thread(study_store.get_study_data, book_meta["id"])
+        restored_study = await asyncio.to_thread(study_store.get_study_data, book_meta["id"])
+        if restored_study and restored_study.get("reading_status") == "completed":
+            _ensure_completed_book_progress_100(book_meta["id"], book_meta)
     except Exception as exc:
         logger.warning("No se pudo inicializar nota/ilustraciones en Obsidian para %s: %s", book_meta["id"], exc)
+
+    save_library(library)
 
     sync_job = None
     valid_audio_uploads = [af for af in (audio_files or []) if af and af.filename]
@@ -822,7 +995,7 @@ async def upload_book(
         library = load_library()
         book_meta = library.get(book_meta["id"], book_meta)
 
-    return {"book": book_meta, "sync_job": sync_job}
+    return {"book": book_meta, "sync_job": sync_job, "restored_from_archive": restored_from_archive}
 
 
 @app.post("/api/books/{book_id}/audiobook/sync")
@@ -849,20 +1022,108 @@ async def sync_external_audiobook_endpoint(
 
 
 @app.delete("/api/books/{book_id}")
-async def delete_book(book_id: str) -> Dict[str, Any]:
+async def delete_book(book_id: str, purge_history: bool = Query(default=False)) -> Dict[str, Any]:
     library = load_library()
+    archived_books = load_archived_books()
+    book_folder = BOOKS_DIR / book_id
+
+    try:
+        await asyncio.to_thread(audio_store.cancel_export_job, book_id)
+    except Exception:
+        pass
+
+    if purge_history:
+        unpaired_partner = None
+        if book_id in library:
+            paired_id = (library[book_id].get("pairing") or {}).get("paired_book_id")
+            if paired_id and paired_id in library:
+                library[paired_id]["pairing"] = None
+                unpaired_partner = paired_id
+            del library[book_id]
+            save_library(library)
+        if book_id in archived_books:
+            del archived_books[book_id]
+            save_archived_books(archived_books)
+        if book_folder.exists():
+            shutil.rmtree(book_folder, ignore_errors=True)
+        await asyncio.to_thread(study_store.delete_study_data, book_id)
+        if unpaired_partner:
+            await asyncio.to_thread(study_store.sync_paired_books_obsidian, None, None, [unpaired_partner])
+        for cov in ARCHIVED_COVERS_DIR.glob(f"{book_id}.*"):
+            try:
+                cov.unlink()
+            except Exception:
+                pass
+        return {"deleted": book_id, "purged_history": True}
+
+    # Modo por defecto: liberar EPUB, capítulos y audios del servidor pero conservar historial, calificación y notas
+    disk_meta: Dict[str, Any] = {}
+    meta_path = book_folder / "metadata.json"
+    if meta_path.exists():
+        try:
+            disk_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            disk_meta = {}
+
+    lib_entry = library.get(book_id) or {}
+    arch_meta: Dict[str, Any] = {**disk_meta, **lib_entry}
+
+    if arch_meta:
+        try:
+            len_info = await asyncio.to_thread(study_store._get_or_compute_book_length, book_id, arch_meta)
+            arch_meta["total_words"] = len_info.get("total_words", arch_meta.get("total_words", 0))
+            arch_meta["estimated_pages"] = len_info.get("estimated_pages", arch_meta.get("estimated_pages", 1))
+            if len_info.get("chapter_sentence_counts"):
+                arch_meta["chapter_sentence_counts"] = len_info["chapter_sentence_counts"]
+        except Exception:
+            pass
+
+        # Asegurar que el cuaderno de lectura queda guardado de forma independiente en study_records/
+        try:
+            study_snap = await asyncio.to_thread(study_store.get_study_data, book_id, False)
+            await asyncio.to_thread(
+                study_store.update_reading_meta,
+                book_id=book_id,
+                genre=(arch_meta.get("genre") or None) if not study_snap.get("genre") else None,
+                published_date=(arch_meta.get("published_date") or None) if not study_snap.get("published_date") else None,
+                author=(arch_meta.get("author") or None) if (not study_snap.get("author") or study_snap.get("author") == "Desconocido") else None,
+            )
+        except Exception:
+            pass
+
+        if book_folder.exists():
+            for cov_file in book_folder.glob("cover.*"):
+                try:
+                    shutil.copy2(cov_file, ARCHIVED_COVERS_DIR / f"{book_id}{cov_file.suffix}")
+                    arch_meta["cover_url"] = f"/api/books/{book_id}/cover"
+                    break
+                except Exception:
+                    pass
+
+        arch_meta["id"] = book_id
+        arch_meta["pairing"] = None
+        arch_meta["has_imported_audiobook"] = False
+        arch_meta["has_embedded_media_overlay"] = False
+        arch_meta["is_archived"] = True
+        arch_meta["archived_at"] = int(time.time())
+        archived_books[book_id] = arch_meta
+        save_archived_books(archived_books)
+
     if book_id in library:
         paired_id = (library[book_id].get("pairing") or {}).get("paired_book_id")
+        unpaired_partner = None
         if paired_id and paired_id in library:
             library[paired_id]["pairing"] = None
+            unpaired_partner = paired_id
         del library[book_id]
         save_library(library)
+        if unpaired_partner:
+            await asyncio.to_thread(study_store.sync_paired_books_obsidian, None, None, [unpaired_partner])
 
-    book_folder = BOOKS_DIR / book_id
     if book_folder.exists():
         shutil.rmtree(book_folder, ignore_errors=True)
 
-    return {"deleted": book_id}
+    return {"deleted": book_id, "archived": True}
 
 
 _ENTITY_STOPWORDS = {
@@ -1228,17 +1489,22 @@ def _apply_book_pairing(
     auto_switch_chapters: bool = True,
     chapter_offset: Optional[int] = None,
     chapter_map: Optional[Dict[str, int]] = None,
+    replaced_ids_out: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Empareja dos libros en `library`, calcula su mapa de capítulos y persiste metadata.json."""
     book_a = library[book_id]
     old_partner_id = (book_a.get("pairing") or {}).get("paired_book_id")
     if old_partner_id and old_partner_id != partner_id and old_partner_id in library:
         library[old_partner_id]["pairing"] = None
+        if replaced_ids_out is not None:
+            replaced_ids_out.append(str(old_partner_id))
 
     book_b = library[partner_id]
     old_b_partner = (book_b.get("pairing") or {}).get("paired_book_id")
     if old_b_partner and old_b_partner != book_id and old_b_partner in library:
         library[old_b_partner]["pairing"] = None
+        if replaced_ids_out is not None:
+            replaced_ids_out.append(str(old_b_partner))
 
     primary_id = primary_book_id
     if primary_id not in (book_id, partner_id):
@@ -1287,6 +1553,15 @@ def _apply_book_pairing(
         "chapter_map": reverse_map,
     }
 
+    for rid in (replaced_ids_out or []):
+        mpath = BOOKS_DIR / str(rid) / "metadata.json"
+        if mpath.exists():
+            try:
+                m = json.loads(mpath.read_text(encoding="utf-8"))
+                m["pairing"] = None
+                mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
     for bid, b_obj in ((book_id, book_a), (partner_id, book_b)):
         mpath = BOOKS_DIR / str(bid) / "metadata.json"
         if mpath.exists():
@@ -1323,6 +1598,12 @@ async def pair_books_endpoint(book_id: str, req: BookPairingRequest) -> Dict[str
                     mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
                 except Exception:
                     pass
+        await asyncio.to_thread(
+            study_store.sync_paired_books_obsidian,
+            None,
+            None,
+            [str(bid) for bid in filter(None, [book_id, old_partner_id])],
+        )
         return {"book": book_a, "paired_book": None}
 
     if req.paired_book_id == book_id:
@@ -1330,6 +1611,7 @@ async def pair_books_endpoint(book_id: str, req: BookPairingRequest) -> Dict[str
     if req.paired_book_id not in library:
         raise HTTPException(status_code=404, detail="El libro pareja seleccionado no existe")
 
+    replaced_ids: List[str] = []
     alignment = await asyncio.to_thread(
         _apply_book_pairing,
         library,
@@ -1339,8 +1621,15 @@ async def pair_books_endpoint(book_id: str, req: BookPairingRequest) -> Dict[str
         auto_switch_chapters=req.auto_switch_chapters,
         chapter_offset=req.chapter_offset,
         chapter_map=req.chapter_map,
+        replaced_ids_out=replaced_ids,
     )
     save_library(library)
+    await asyncio.to_thread(
+        study_store.sync_paired_books_obsidian,
+        book_id,
+        req.paired_book_id,
+        replaced_ids,
+    )
     return {"book": library[book_id], "paired_book": library[req.paired_book_id], "alignment": alignment}
 
 
@@ -1445,22 +1734,23 @@ async def update_book_study_meta(
         published_date=req.published_date,
         author=req.author,
     )
-    # Sincronizar también en library.json y metadata.json del libro
+    # Sincronizar también en library.json, archived_books.json y metadata.json del libro
+    def _apply_meta_to_dict(target: Dict[str, Any]) -> None:
+        if req.genre is not None:
+            target["genre"] = req.genre.strip()
+            target["genres"] = [g.strip() for g in req.genre.split(",") if g.strip()]
+        if req.published_date is not None:
+            p_date, p_yr = epub_parser._parse_opf_publication_date(req.published_date)
+            target["published_date"] = p_date or req.published_date.strip()
+            target["published_year"] = p_yr
+        if req.author is not None and req.author.strip():
+            target["author"] = req.author.strip()
+
     library = load_library()
     if book_id in library:
         if study.get("reading_status") == "completed":
             _ensure_completed_book_progress_100(book_id, library[book_id])
-        if req.genre is not None:
-            library[book_id]["genre"] = req.genre.strip()
-            library[book_id]["genres"] = [
-                g.strip() for g in req.genre.split(",") if g.strip()
-            ]
-        if req.published_date is not None:
-            p_date, p_yr = epub_parser._parse_opf_publication_date(req.published_date)
-            library[book_id]["published_date"] = p_date or req.published_date.strip()
-            library[book_id]["published_year"] = p_yr
-        if req.author is not None and req.author.strip():
-            library[book_id]["author"] = req.author.strip()
+        _apply_meta_to_dict(library[book_id])
         save_library(library)
         meta_path = BOOKS_DIR / book_id / "metadata.json"
         if meta_path.exists():
@@ -1468,17 +1758,15 @@ async def update_book_study_meta(
                 m = json.loads(meta_path.read_text(encoding="utf-8"))
                 if study.get("reading_status") == "completed":
                     m["progress"] = library[book_id].get("progress", m.get("progress", {}))
-                if req.genre is not None:
-                    m["genre"] = library[book_id].get("genre", "")
-                    m["genres"] = library[book_id].get("genres", [])
-                if req.published_date is not None:
-                    m["published_date"] = library[book_id].get("published_date", "")
-                    m["published_year"] = library[book_id].get("published_year")
-                if req.author is not None and req.author.strip():
-                    m["author"] = req.author.strip()
+                _apply_meta_to_dict(m)
                 meta_path.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception:
                 pass
+    else:
+        archived_books = load_archived_books()
+        if book_id in archived_books:
+            _apply_meta_to_dict(archived_books[book_id])
+            save_archived_books(archived_books)
 
     md = await asyncio.to_thread(study_store.get_obsidian_markdown, book_id)
     obs_cfg = await asyncio.to_thread(study_store.get_obsidian_config, book_id)
@@ -1806,12 +2094,26 @@ async def get_book_offline_bundle(book_id: str) -> Dict[str, Any]:
     obsidian_md = await asyncio.to_thread(study_store.get_obsidian_markdown, book_id)
     exports_info = await asyncio.to_thread(audio_store.list_book_exports, book_id)
 
+    asset_urls: List[str] = []
+    seen_assets = set()
+    if meta.get("cover_url"):
+        c_url = str(meta["cover_url"])
+        seen_assets.add(c_url)
+        asset_urls.append(c_url)
+    for ch in chapters:
+        ch_html = ch.get("html") or ""
+        for m_src in re.findall(r'src="(/api/books/[^"]+)"', ch_html):
+            if m_src not in seen_assets:
+                seen_assets.add(m_src)
+                asset_urls.append(m_src)
+
     return {
         "book": meta,
         "chapters": chapters,
         "study": study_data,
         "obsidian_markdown": obsidian_md,
         "exports": exports_info.get("exports", []),
+        "assets": asset_urls,
     }
 
 
@@ -1886,19 +2188,27 @@ async def get_chapter_offline_audio_pack(
 @app.get("/api/books/{book_id}/cover")
 async def get_book_cover(book_id: str) -> FileResponse:
     book_folder = BOOKS_DIR / book_id
-    if not book_folder.exists():
-        raise HTTPException(status_code=404, detail="Libro no encontrado")
-    for p in book_folder.glob("cover.*"):
-        return FileResponse(p)
+    if book_folder.exists():
+        for p in book_folder.glob("cover.*"):
+            return FileResponse(p)
+    if ARCHIVED_COVERS_DIR.exists():
+        for p in ARCHIVED_COVERS_DIR.glob(f"{book_id}.*"):
+            return FileResponse(p)
     raise HTTPException(status_code=404, detail="Portada no disponible")
 
 
 @app.get("/api/books/{book_id}/assets/{asset_path:path}")
 async def get_book_asset(book_id: str, asset_path: str) -> FileResponse:
+    import urllib.parse
     assets_root = (BOOKS_DIR / book_id / "assets").resolve()
     requested = (assets_root / asset_path).resolve()
     if not str(requested).startswith(str(assets_root)) or not requested.is_file():
-        raise HTTPException(status_code=404, detail="Recurso no encontrado")
+        decoded = urllib.parse.unquote(asset_path)
+        requested_dec = (assets_root / decoded).resolve()
+        if str(requested_dec).startswith(str(assets_root)) and requested_dec.is_file():
+            requested = requested_dec
+        else:
+            raise HTTPException(status_code=404, detail="Recurso no encontrado")
     return FileResponse(requested)
 
 
@@ -1906,6 +2216,11 @@ async def get_book_asset(book_id: str, asset_path: str) -> FileResponse:
 async def get_voices() -> Dict[str, Any]:
     gpu_info = await asyncio.to_thread(tts_manager.get_gpu_status)
     return {"voices": tts_manager.list_voices(), "gpu": gpu_info}
+
+
+@app.get("/api/tts/updates")
+async def check_tts_engine_updates(force: bool = Query(default=False)) -> Dict[str, Any]:
+    return await asyncio.to_thread(tts_manager.check_engine_updates, force)
 
 
 @app.delete("/api/voices/downloaded/{voice_id:path}")

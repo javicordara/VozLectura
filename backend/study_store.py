@@ -2,6 +2,7 @@ import datetime
 import json
 import logging
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -51,14 +52,17 @@ def _normalize_half_star_rating(val: Any) -> Any:
     return int(norm) if norm.is_integer() else norm
 
 
-def _format_stars_obsidian(rating_val: Any) -> str:
+def _format_stars_obsidian(rating_val: Any, is_en: bool = False) -> str:
     r = float(_normalize_half_star_rating(rating_val))
     if r <= 0:
-        return "Sin calificar"
+        return "Unrated" if is_en else "Sin calificar"
     full = int(r)
     has_half = (r - full) >= 0.49
     stars_str = ("⭐" * full) + ("½" if has_half else "")
-    num_str = str(int(r)) if r.is_integer() else f"{r:.1f}".replace(".", ",")
+    if is_en:
+        num_str = str(int(r)) if r.is_integer() else f"{r:.1f}"
+    else:
+        num_str = str(int(r)) if r.is_integer() else f"{r:.1f}".replace(".", ",")
     return f"{stars_str} ({num_str}/5)".strip()
 
 
@@ -76,23 +80,70 @@ class BookStudyStore:
         self.books_dir = books_dir
         self.obsidian_dir = data_dir / "obsidian_notes"
         self.obsidian_dir.mkdir(parents=True, exist_ok=True)
+        self.study_records_dir = data_dir / "study_records"
+        self.study_records_dir.mkdir(parents=True, exist_ok=True)
+        self.archived_books_file = data_dir / "archived_books.json"
+        self.archived_covers_dir = data_dir / "archived_covers"
+        self.archived_covers_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._cached_vaults: Optional[List[Dict[str, str]]] = None
         self._cached_vaults_ts: float = 0.0
         self._cached_obs_cfg: Optional[Dict[str, Any]] = None
         self._cached_obs_cfg_ts: float = 0.0
+        self._migrate_legacy_study_files()
+
+    def _migrate_legacy_study_files(self) -> None:
+        """Migra ficheros legacy books/<id>/study_data.json a study_records/<id>.json si aún no existen."""
+        if not self.books_dir.exists():
+            return
+        try:
+            for d in self.books_dir.iterdir():
+                if not d.is_dir():
+                    continue
+                legacy_sf = d / "study_data.json"
+                target_sf = self.study_records_dir / f"{d.name}.json"
+                if legacy_sf.exists() and not target_sf.exists():
+                    try:
+                        shutil.copy2(legacy_sf, target_sf)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _study_file(self, book_id: str) -> Path:
+        return self.study_records_dir / f"{book_id}.json"
+
+    def _legacy_study_file(self, book_id: str) -> Path:
         return self.books_dir / book_id / "study_data.json"
 
     def _meta_file(self, book_id: str) -> Path:
         return self.books_dir / book_id / "metadata.json"
+
+    def _load_archived_books_map(self) -> Dict[str, Dict[str, Any]]:
+        if not self.archived_books_file.exists():
+            return {}
+        try:
+            data = json.loads(self.archived_books_file.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
     def _get_book_meta(self, book_id: str) -> Dict[str, Any]:
         mf = self._meta_file(book_id)
         if mf.exists():
             try:
                 return json.loads(mf.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        archived = self._load_archived_books_map()
+        if book_id in archived and isinstance(archived[book_id], dict):
+            return archived[book_id]
+        lib_file = self.data_dir / "library.json"
+        if lib_file.exists():
+            try:
+                lib = json.loads(lib_file.read_text(encoding="utf-8"))
+                if isinstance(lib, dict) and book_id in lib and isinstance(lib[book_id], dict):
+                    return lib[book_id]
             except Exception:
                 pass
         return {"id": book_id, "title": book_id, "author": "Desconocido", "language": "es"}
@@ -117,6 +168,7 @@ class BookStudyStore:
             "vocabulary": [],
             "highlights": [],
             "sessions": [],
+            "pairing_info": None,
             "epub_illustrations": [],
             "illustrations_extracted": False,
             "obsidian_linked_relpath": "",
@@ -316,6 +368,142 @@ class BookStudyStore:
                 pass
         return target, rel.replace("\\", "/")
 
+    def _read_study_readonly_unlocked(self, book_id: str) -> Dict[str, Any]:
+        """Lee el study record de otro libro sin adquirir bloqueos ni escribir en disco."""
+        for cand in (
+            self._study_file(book_id),
+            self._legacy_study_file(book_id),
+        ):
+            if cand.exists():
+                try:
+                    loaded = json.loads(cand.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        return loaded
+                except Exception:
+                    pass
+        meta = self._get_book_meta(book_id)
+        return {
+            "book_id": book_id,
+            "title": meta.get("title", book_id),
+            "author": meta.get("author", ""),
+            "language": meta.get("language", "es"),
+            "sessions": [],
+            "obsidian_linked_relpath": "",
+        }
+
+    def _get_pairing_render_context_unlocked(
+        self, book_id: str, data: Dict[str, Any], cfg: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Obtiene de forma segura (solo lectura) los datos de la edición pareja para enlazar ambas notas en Obsidian."""
+        if not book_id:
+            return None
+
+        pairing_raw: Optional[Dict[str, Any]] = None
+        found_in_active_lib = False
+        lib_dict: Dict[str, Any] = {}
+        lib_file = self.data_dir / "library.json"
+        if lib_file.exists():
+            try:
+                loaded_lib = json.loads(lib_file.read_text(encoding="utf-8"))
+                if isinstance(loaded_lib, dict):
+                    lib_dict = loaded_lib
+                    if book_id in lib_dict and isinstance(lib_dict[book_id], dict):
+                        found_in_active_lib = True
+                        p_cand = lib_dict[book_id].get("pairing")
+                        if isinstance(p_cand, dict) and p_cand.get("paired_book_id"):
+                            pairing_raw = p_cand
+            except Exception:
+                pass
+
+        if not found_in_active_lib:
+            mf = self._meta_file(book_id)
+            if mf.exists():
+                try:
+                    m_data = json.loads(mf.read_text(encoding="utf-8"))
+                    p_cand = m_data.get("pairing")
+                    if isinstance(p_cand, dict) and p_cand.get("paired_book_id"):
+                        pairing_raw = p_cand
+                except Exception:
+                    pass
+            if not pairing_raw and isinstance(data.get("pairing_info"), dict) and data["pairing_info"].get("paired_book_id"):
+                pairing_raw = data["pairing_info"]
+
+        if not pairing_raw or not pairing_raw.get("paired_book_id"):
+            if found_in_active_lib:
+                data["pairing_info"] = None
+            return None
+
+        partner_id = str(pairing_raw["paired_book_id"])
+        partner_lib = lib_dict.get(partner_id) if isinstance(lib_dict.get(partner_id), dict) else self._get_book_meta(partner_id)
+        partner_study = self._read_study_readonly_unlocked(partner_id)
+
+        partner_title = (
+            partner_lib.get("title")
+            or partner_study.get("title")
+            or pairing_raw.get("paired_book_title")
+            or partner_id
+        )
+        partner_lang = (
+            partner_lib.get("language")
+            or partner_study.get("language")
+            or pairing_raw.get("paired_book_lang")
+            or "es"
+        )
+
+        partner_probe = dict(partner_study)
+        if not partner_probe.get("title"):
+            partner_probe["title"] = partner_title
+        _, partner_rel = self._resolve_obsidian_vault_file_unlocked(partner_id, partner_probe, cfg)
+        partner_stem = Path(partner_rel).stem if partner_rel else _safe_filename(partner_title)
+
+        partner_sessions = partner_study.get("sessions") or []
+        partner_total_sec = sum(int(s.get("duration_seconds") or 0) for s in partner_sessions)
+
+        ctx = {
+            "paired_book_id": partner_id,
+            "paired_book_title": partner_title,
+            "paired_book_lang": partner_lang,
+            "partner_obsidian_note": partner_stem,
+            "partner_obsidian_relpath": partner_rel,
+            "partner_total_seconds": partner_total_sec,
+            "partner_time_human": _format_duration_human(partner_total_sec),
+        }
+        data["pairing_info"] = {
+            "paired_book_id": partner_id,
+            "paired_book_title": partner_title,
+            "paired_book_lang": partner_lang,
+            "partner_obsidian_note": partner_stem,
+        }
+        return ctx
+
+    def sync_paired_books_obsidian(
+        self,
+        book_a_id: Optional[str] = None,
+        book_b_id: Optional[str] = None,
+        unpair_ids: Optional[List[str]] = None,
+    ) -> None:
+        """Regenera las notas .md de Obsidian de los libros recién emparejados o desemparejados para mantener enlaces recíprocos."""
+        with self._lock:
+            for uid in (unpair_ids or []):
+                if not uid:
+                    continue
+                try:
+                    u_data = self._load_unlocked(str(uid))
+                    u_data = self._sync_from_obsidian_vault_if_newer_unlocked(str(uid), u_data)
+                    u_data["pairing_info"] = None
+                    self._save_unlocked(str(uid), u_data)
+                except Exception as exc:
+                    logger.debug("Error actualizando nota Obsidian tras desvincular %s: %s", uid, exc)
+
+            for bid in filter(None, [book_a_id, book_b_id]):
+                try:
+                    b_data = self._load_unlocked(str(bid))
+                    b_data = self._sync_from_obsidian_vault_if_newer_unlocked(str(bid), b_data)
+                    self._get_pairing_render_context_unlocked(str(bid), b_data)
+                    self._save_unlocked(str(bid), b_data)
+                except Exception as exc:
+                    logger.debug("Error actualizando nota Obsidian tras emparejar %s: %s", bid, exc)
+
     def find_obsidian_attachment(self, name: str) -> Optional[Path]:
         """Busca una imagen o adjunto incrustado de Obsidian (![[archivo.png]]) dentro de la bóveda activa."""
         clean_name = (name or "").strip().split("|")[0].strip().lstrip("/\\")
@@ -399,7 +587,14 @@ class BookStudyStore:
             data = self._load_unlocked(book_id)
             if sync_obsidian:
                 data = self._sync_from_obsidian_vault_if_newer_unlocked(book_id, data)
-            if self._ensure_epub_illustrations_unlocked(book_id, data):
+            prev_pair = data.get("pairing_info")
+            self._get_pairing_render_context_unlocked(book_id, data)
+            pair_changed = data.get("pairing_info") != prev_pair
+            if pair_changed and not sync_obsidian:
+                data = self._sync_from_obsidian_vault_if_newer_unlocked(book_id, data)
+                self._get_pairing_render_context_unlocked(book_id, data)
+            ill_changed = self._ensure_epub_illustrations_unlocked(book_id, data)
+            if pair_changed or ill_changed:
                 self._save_unlocked(book_id, data)
             return self._enrich_stats(data)
 
@@ -451,17 +646,27 @@ class BookStudyStore:
 
     def _load_unlocked(self, book_id: str) -> Dict[str, Any]:
         sf = self._study_file(book_id)
-        if not sf.exists():
+        source_file = sf if sf.exists() else None
+        if source_file is None:
+            legacy = self._legacy_study_file(book_id)
+            if legacy.exists():
+                source_file = legacy
+
+        if source_file is None:
             data = self._default_study_data(book_id)
             self._save_unlocked(book_id, data)
             return data
         try:
-            data = json.loads(sf.read_text(encoding="utf-8"))
+            data = json.loads(source_file.read_text(encoding="utf-8"))
             defaults = self._default_study_data(book_id)
+            dirty = not sf.exists()
             for k, v in defaults.items():
                 if k not in data:
                     data[k] = v
+                    dirty = True
             if self._sanitize_and_recalibrate_sessions_unlocked(data):
+                dirty = True
+            if dirty:
                 self._save_unlocked(book_id, data)
             return data
         except Exception as exc:
@@ -564,18 +769,62 @@ class BookStudyStore:
                     data["genre"] = g_val
                     changed = True
 
+            author_m = re.search(r'(?m)^author:\s*"?([^"\n]+)"?\s*$', fm_block)
+            if author_m:
+                a_val = author_m.group(1).strip()
+                if a_val and a_val != "—" and (not data.get("author") or data.get("author") in ("Desconocido", "Autor desconocido")):
+                    data["author"] = a_val
+                    changed = True
+
+            lang_m = re.search(r"(?m)^language:\s*([^\n]+?)\s*$", fm_block)
+            if lang_m:
+                l_val = lang_m.group(1).strip().strip('"\'')
+                if l_val and not data.get("language"):
+                    data["language"] = l_val
+                    changed = True
+
+            started_m = re.search(r"(?m)^(?:started|fecha_inicio):\s*(\d{4}-\d{2}-\d{2})\s*$", fm_block)
+            if started_m and not data.get("started_at"):
+                try:
+                    dt_s = datetime.datetime.strptime(started_m.group(1), "%Y-%m-%d").replace(hour=12)
+                    data["started_at"] = int(dt_s.timestamp())
+                    changed = True
+                except Exception:
+                    pass
+
+            finished_m = re.search(r"(?m)^(?:finished|fecha_fin):\s*(\d{4}-\d{2}-\d{2})\s*$", fm_block)
+            if finished_m and not data.get("finished_at"):
+                try:
+                    dt_f = datetime.datetime.strptime(finished_m.group(1), "%Y-%m-%d").replace(hour=12)
+                    data["finished_at"] = int(dt_f.timestamp())
+                    changed = True
+                except Exception:
+                    pass
+
         # 2. Analizar secciones ## del cuerpo Markdown
-        placeholder_note = "_Escribe aquí tus notas, ideas o reflexiones (en la app o directamente en Obsidian)..._"
+        placeholder_notes = (
+            "_Escribe aquí tus notas, ideas o reflexiones (en la app o directamente en Obsidian)..._",
+            "_Write your general notes, ideas, or reflections here (in the app or directly in Obsidian)..._",
+        )
         sections = re.split(r"(?m)^(?=##\s+)", body)
         extracted_notes_parts: List[str] = []
 
         # Comprobar si el encabezado previo al primer ## tiene texto libre añadido por el usuario en Obsidian
         preamble = sections[0] if sections else ""
         preamble_lines = []
+        in_paired_callout = False
         for line in preamble.splitlines():
             s_line = line.strip()
-            if s_line.startswith("# 📖 ") or s_line.startswith("**Autor:**"):
+            if s_line.startswith("# 📖 ") or s_line.startswith("**Autor:**") or s_line.startswith("**Author:**"):
+                in_paired_callout = False
                 continue
+            if s_line.startswith("> [!abstract] 🌐"):
+                in_paired_callout = True
+                continue
+            if in_paired_callout:
+                if s_line.startswith(">"):
+                    continue
+                in_paired_callout = False
             preamble_lines.append(line)
         preamble_clean = "\n".join(preamble_lines).strip()
         if preamble_clean:
@@ -588,20 +837,28 @@ class BookStudyStore:
             heading = lines[0].strip()
             sec_body = "\n".join(lines[1:]).strip()
 
-            if heading.startswith("## 📊 Registro de Hábitos de Lectura"):
+            if heading.startswith("## 📊 Registro de Hábitos") or heading.startswith("## 📊 Reading Habits"):
                 continue
-            elif heading.startswith("## 💭 Notas Generales y Reflexiones"):
-                cleaned_sec = sec_body.replace(placeholder_note, "").strip()
+            elif heading.startswith("## 💭 Notas Generales") or heading.startswith("## 💭 General Notes"):
+                cleaned_sec = sec_body
+                for ph in placeholder_notes:
+                    cleaned_sec = cleaned_sec.replace(ph, "")
+                cleaned_sec = cleaned_sec.strip()
                 if cleaned_sec:
                     extracted_notes_parts.append(cleaned_sec)
-            elif heading.startswith("## 🖍️ Pasajes Resaltados y Notas"):
+            elif heading.startswith("## 🖍️ Pasajes Resaltados") or heading.startswith("## 🖍️ Highlighted Passages"):
                 # Sincronizar notas editadas en pasajes existentes o nuevos bloques citados en Obsidian
-                self._sync_highlights_from_markdown_section_unlocked(data, sec_body)
-            elif heading.startswith("## 📚 Vocabulario y Palabras Subrayadas"):
+                if self._sync_highlights_from_markdown_section_unlocked(data, sec_body):
+                    changed = True
+            elif heading.startswith("## 📚 Vocabulario") or heading.startswith("## 📚 Vocabulary"):
+                if not data.get("vocabulary") and self._sync_vocabulary_from_markdown_section_unlocked(data, sec_body):
+                    changed = True
                 continue
-            elif heading.startswith("## ⏱️ Historial de Sesiones de Lectura"):
+            elif heading.startswith("## ⏱️ Historial de Sesiones") or heading.startswith("## ⏱️ Reading Sessions"):
+                if not data.get("sessions") and self._sync_sessions_from_markdown_section_unlocked(data, sec_body):
+                    changed = True
                 continue
-            elif heading.startswith("## 🗺️ Mapas e Ilustraciones"):
+            elif heading.startswith("## 🗺️ Mapas e Ilustraciones") or heading.startswith("## 🗺️ Maps & Illustrations"):
                 parsed_ills: List[Dict[str, Any]] = []
                 last_lbl = ""
                 for raw_l in sec_body.splitlines():
@@ -645,9 +902,14 @@ class BookStudyStore:
 
     def _sync_highlights_from_markdown_section_unlocked(
         self, data: Dict[str, Any], sec_body: str
-    ) -> None:
-        if not sec_body or "_Aún no hay pasajes resaltados" in sec_body:
-            return
+    ) -> bool:
+        if (
+            not sec_body
+            or "_Aún no hay pasajes resaltados" in sec_body
+            or "_No highlighted passages" in sec_body
+        ):
+            return False
+        changed = False
         highlights: List[Dict[str, Any]] = data.get("highlights") or []
         blocks = re.split(r"(?m)^###\s+📍\s+", sec_body)
         for blk in blocks[1:]:
@@ -664,8 +926,8 @@ class BookStudyStore:
                     continue
                 elif s_bl.startswith(">"):
                     quote_lines.append(s_bl.lstrip(">").strip())
-                elif s_bl.startswith("**📝 Nota:**"):
-                    note_text = s_bl.replace("**📝 Nota:**", "", 1).strip()
+                elif s_bl.startswith("**📝 Nota:**") or s_bl.startswith("**📝 Note:**"):
+                    note_text = re.sub(r"^\*\*📝\s*(?:Nota|Note):\*\*\s*", "", s_bl).strip()
             quote_str = "\n".join(quote_lines).strip()
             if not quote_str:
                 continue
@@ -677,6 +939,7 @@ class BookStudyStore:
                 if note_text and existing.get("note") != note_text:
                     existing["note"] = note_text
                     existing["updated_at"] = int(time.time())
+                    changed = True
             else:
                 highlights.insert(
                     0,
@@ -692,7 +955,186 @@ class BookStudyStore:
                         "updated_at": int(time.time()),
                     },
                 )
+                changed = True
         data["highlights"] = highlights
+        return changed
+
+    def _sync_vocabulary_from_markdown_section_unlocked(
+        self, data: Dict[str, Any], sec_body: str
+    ) -> bool:
+        if (
+            not sec_body
+            or "_Aún no hay palabras guardadas" in sec_body
+            or "_No vocabulary words saved yet" in sec_body
+        ):
+            return False
+        recovered: List[Dict[str, Any]] = []
+        cur_entry: Optional[Dict[str, Any]] = None
+        now_ts = int(time.time())
+        for raw_line in sec_body.splitlines():
+            s_raw = raw_line.strip()
+            m_head = re.match(
+                r"^- \*\*(.+?)\*\*(?:\s+`/([^/`]+)/`)?\s+→\s+\*\*(.+?)\*\*\s+_\((?:consultada|looked up)\s+(\d+)\s+(?:ve(?:z|ces)|times?)\s+•\s+(.+?)\)_\s*$",
+                s_raw,
+            )
+            if m_head:
+                if cur_entry:
+                    recovered.append(cur_entry)
+                w_txt = m_head.group(1).strip()
+                cur_entry = {
+                    "id": f"voc_{uuid.uuid4().hex[:10]}",
+                    "word": w_txt,
+                    "lemma": w_txt.lower(),
+                    "phonetic": (m_head.group(2) or "").strip(),
+                    "source_lang": data.get("language", "es")[:2],
+                    "translation": m_head.group(3).strip(),
+                    "definitions_summary": "",
+                    "context_sentence": "",
+                    "context_translation": "",
+                    "chapter_index": 0,
+                    "chapter_title": m_head.group(5).strip(),
+                    "sentence_index": 0,
+                    "user_note": "",
+                    "note": "",
+                    "lookup_count": max(1, int(m_head.group(4) or 1)),
+                    "created_at": now_ts,
+                    "updated_at": now_ts,
+                }
+                continue
+            if cur_entry:
+                s = raw_line.strip()
+                if s.startswith("- *Definición:*") or s.startswith("- *Definition:*"):
+                    cur_entry["definitions_summary"] = re.sub(
+                        r"^- \*(?:Definición|Definition):\*\s*", "", s
+                    ).strip()
+                elif s.startswith("- *Contexto en el libro:*") or s.startswith("- *Context in book:*"):
+                    ctx = re.sub(
+                        r"^- \*(?:Contexto en el libro|Context in book):\*\s*", "", s
+                    ).strip().strip("«»")
+                    cur_entry["context_sentence"] = ctx
+                elif s.startswith("- *Traducción del contexto:*") or s.startswith("- *Context translation:*"):
+                    ct = re.sub(
+                        r"^- \*(?:Traducción del contexto|Context translation):\*\s*", "", s
+                    ).strip().strip("«»")
+                    cur_entry["context_translation"] = ct
+                elif s.startswith("- *Nota personal:*") or s.startswith("- *Personal note:*"):
+                    nt = re.sub(
+                        r"^- \*(?:Nota personal|Personal note):\*\s*", "", s
+                    ).strip()
+                    cur_entry["user_note"] = nt
+                    cur_entry["note"] = nt
+        if cur_entry:
+            recovered.append(cur_entry)
+        if recovered:
+            data["vocabulary"] = recovered
+            return True
+        return False
+
+    def _sync_sessions_from_markdown_section_unlocked(
+        self, data: Dict[str, Any], sec_body: str
+    ) -> bool:
+        if (
+            not sec_body
+            or "_Aún no se han registrado sesiones" in sec_body
+            or "_No reading sessions recorded yet" in sec_body
+        ):
+            return False
+        recovered: List[Dict[str, Any]] = []
+        for raw_line in sec_body.splitlines():
+            s = raw_line.strip()
+            if (
+                not s.startswith("|")
+                or s.startswith("| Fecha |")
+                or s.startswith("| Date |")
+                or s.startswith("| :---")
+            ):
+                continue
+            parts = [p.strip() for p in s.strip("|").split("|")]
+            if len(parts) < 5:
+                continue
+            date_s, time_s, dur_s, ch_s, fr_s = parts[:5]
+            note_s = parts[5] if len(parts) > 5 else ""
+            if not re.match(r"^\d{4}-\d{2}-\d{2}$", date_s):
+                continue
+            hh, mm = 12, 0
+            m_t = re.match(r"^(\d{1,2}):(\d{2})$", time_s)
+            if m_t:
+                hh, mm = int(m_t.group(1)), int(m_t.group(2))
+            try:
+                started_ts = int(datetime.datetime.strptime(f"{date_s} {hh:02d}:{mm:02d}", "%Y-%m-%d %H:%M").timestamp())
+            except Exception:
+                continue
+            dur_sec = 60
+            m_hm = re.search(r"(\d+)\s*h\s*(\d+)\s*min", dur_s)
+            m_m = re.search(r"(\d+)\s*min", dur_s)
+            if m_hm:
+                dur_sec = (int(m_hm.group(1)) * 60 + int(m_hm.group(2))) * 60
+            elif m_m:
+                dur_sec = max(1, int(m_m.group(1))) * 60
+            sc, ec = 0, 0
+            ch_title = ch_s
+            m_ch_rng = re.match(r"^(?:Cap\.|Ch\.)\s*(\d+)(?:\s*→\s*(\d+))?(?:\s*\((.+)\))?$", ch_s)
+            if m_ch_rng:
+                sc = max(0, int(m_ch_rng.group(1)) - 1)
+                ec = max(sc, int(m_ch_rng.group(2) or m_ch_rng.group(1)) - 1)
+                if m_ch_rng.group(3):
+                    ch_title = m_ch_rng.group(3).strip()
+            try:
+                sents_read = max(0, int(fr_s))
+            except Exception:
+                sents_read = 0
+            recovered.append({
+                "id": f"sess_md_{uuid.uuid4().hex[:8]}",
+                "started_at": started_ts,
+                "ended_at": started_ts + dur_sec,
+                "duration_seconds": dur_sec,
+                "start_chapter": sc,
+                "end_chapter": ec,
+                "chapter_title": ch_title,
+                "sentences_read": sents_read,
+                "note": note_s,
+            })
+        if recovered:
+            recovered.sort(key=lambda x: int(x.get("started_at") or 0), reverse=True)
+            data["sessions"] = recovered
+            return True
+        return False
+
+    def migrate_book_id(
+        self, old_book_id: str, new_book_id: str, new_meta: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """Revincula el cuaderno de estudio y sesiones de un libro archivado a un nuevo book_id."""
+        with self._lock:
+            if not old_book_id or not new_book_id:
+                return False
+            if old_book_id == new_book_id:
+                return True
+            data = self._load_unlocked(old_book_id)
+            data["book_id"] = new_book_id
+            if isinstance(new_meta, dict):
+                if new_meta.get("title"):
+                    data["title"] = new_meta["title"]
+                if new_meta.get("author") and (not data.get("author") or data.get("author") in ("Desconocido", "Autor desconocido")):
+                    data["author"] = new_meta["author"]
+                if new_meta.get("language"):
+                    data["language"] = new_meta["language"]
+            self._save_unlocked(new_book_id, data)
+            old_sf = self._study_file(old_book_id)
+            if old_sf.exists():
+                try:
+                    old_sf.unlink()
+                except Exception:
+                    pass
+            return True
+
+    def delete_study_data(self, book_id: str) -> None:
+        with self._lock:
+            sf = self._study_file(book_id)
+            if sf.exists():
+                try:
+                    sf.unlink()
+                except Exception:
+                    pass
 
     def sync_book_with_obsidian(
         self, book_id: str, link_relpath: Optional[str] = None
@@ -703,6 +1145,7 @@ class BookStudyStore:
             if link_relpath is not None:
                 data["obsidian_linked_relpath"] = link_relpath.strip()
                 data["last_obsidian_vault_mtime"] = 0.0
+            self._get_pairing_render_context_unlocked(book_id, data)
             data = self._sync_from_obsidian_vault_if_newer_unlocked(book_id, data, force=True)
             md_text = self._render_obsidian_markdown(data)
             cfg = self.get_obsidian_config_unlocked()
@@ -734,9 +1177,11 @@ class BookStudyStore:
         sf.parent.mkdir(parents=True, exist_ok=True)
         now_ts = int(time.time())
         data["updated_at"] = now_ts
+        book_dir = self.books_dir / book_id
         try:
             md_text = self._render_obsidian_markdown(data)
-            (sf.parent / "obsidian_note.md").write_text(md_text, encoding="utf-8")
+            if book_dir.is_dir():
+                (book_dir / "obsidian_note.md").write_text(md_text, encoding="utf-8")
             safe_title = _safe_filename(data.get("title") or book_id)
             (self.obsidian_dir / f"{safe_title}.md").write_text(md_text, encoding="utf-8")
 
@@ -758,6 +1203,11 @@ class BookStudyStore:
 
         json_text = json.dumps(data, ensure_ascii=False, indent=2)
         sf.write_text(json_text, encoding="utf-8")
+        if book_dir.is_dir():
+            try:
+                (book_dir / "study_data.json").write_text(json_text, encoding="utf-8")
+            except Exception:
+                pass
 
     def _enrich_stats(self, data: Dict[str, Any]) -> Dict[str, Any]:
         sessions = data.get("sessions") or []
@@ -1152,17 +1602,38 @@ class BookStudyStore:
     def _render_obsidian_markdown(self, data: Dict[str, Any]) -> str:
         enriched = self._enrich_stats(data)
         stats = enriched["stats"]
-        title = data.get("title") or "Libro"
-        author = data.get("author") or "Desconocido"
         lang = data.get("language") or "es"
-        status_map = {
-            "reading": "📖 Leyendo",
-            "completed": "✅ Terminado",
-            "paused": "⏸️ En pausa",
-            "wishlist": "📌 Pendiente",
-        }
-        status_str = status_map.get(data.get("reading_status", "reading"), "📖 Leyendo")
-        stars = _format_stars_obsidian(data.get("rating"))
+        is_en = str(lang).lower().startswith("en")
+        title = data.get("title") or ("Book" if is_en else "Libro")
+        raw_author = (data.get("author") or "").strip()
+        if not raw_author or (is_en and raw_author in ("Desconocido", "Autor desconocido")):
+            author = "Unknown" if is_en else "Desconocido"
+        else:
+            author = raw_author
+
+        if is_en:
+            status_map = {
+                "reading": "📖 Reading",
+                "completed": "✅ Completed",
+                "paused": "⏸️ Paused",
+                "wishlist": "📌 Wishlist",
+            }
+            status_str = status_map.get(data.get("reading_status", "reading"), "📖 Reading")
+        else:
+            status_map = {
+                "reading": "📖 Leyendo",
+                "completed": "✅ Terminado",
+                "paused": "⏸️ En pausa",
+                "wishlist": "📌 Pendiente",
+            }
+            status_str = status_map.get(data.get("reading_status", "reading"), "📖 Leyendo")
+
+        stars = _format_stars_obsidian(data.get("rating"), is_en=is_en)
+        body_finished_str = (
+            "In progress"
+            if (is_en and stats["finished_date_str"] == "En curso")
+            else stats["finished_date_str"]
+        )
 
         es_status_map = {
             "reading": "leyendo",
@@ -1172,6 +1643,10 @@ class BookStudyStore:
         }
         es_estado = es_status_map.get(data.get("reading_status", "reading"), "leyendo")
         genre_str = (data.get("genre") or "").strip()
+        pair_ctx = self._get_pairing_render_context_unlocked(
+            str(data.get("book_id") or ""), data
+        )
+
         lines: List[str] = [
             "---",
             f'title: "{title.replace(chr(34), chr(39))}"',
@@ -1179,57 +1654,149 @@ class BookStudyStore:
             f"language: {lang}",
             f'genre: "{genre_str.replace(chr(34), chr(39))}"' if genre_str else 'genre: ""',
             f"status: {data.get('reading_status', 'reading')}",
-            f"estado: {es_estado}",
-            f"started: {stats['started_date_str']}",
-            f"fecha_inicio: {stats['started_date_str'] if stats['started_date_str'] != '—' else ''}",
-            f"finished: {stats['finished_date_str']}",
-            f"fecha_fin: {stats['finished_date_str'] if stats['finished_date_str'] != '—' else ''}",
-            f"times_read: {data.get('times_read', 1)}",
-            f"Nº Lecturas: {data.get('times_read', 1)}",
-            f'reading_time: "{stats["total_time_human"]}"',
-            f"sessions_count: {stats['session_count']}",
-            f"rating: {data.get('rating', 0)}",
-            f"calificacion: {data.get('rating', 0) if data.get('rating') else ''}",
-            "tags:",
-            "  - libros",
-            "  - lectura",
-            "  - vozlectura",
-            "---",
-            "",
-            f"# 📖 {title}",
-            f"**Autor:** {author} | **Idioma:** `{lang}` | **Estado:** {status_str}",
-            "",
-            "## 📊 Registro de Hábitos de Lectura",
-            f"- **Fecha de inicio:** {stats['started_date_str']}",
-            f"- **Fecha de finalización:** {stats['finished_date_str']}",
-            f"- **Veces leído:** {data.get('times_read', 1)}",
-            f"- **Tiempo total de lectura/escucha:** {stats['total_time_human']} ({stats['session_count']} sesiones en {stats['days_read_count']} días)",
-            f"- **Valoración:** {stars}",
-            "",
         ]
+        if not is_en:
+            lines.append(f"estado: {es_estado}")
+        lines.append(f"started: {stats['started_date_str']}")
+        if not is_en:
+            lines.append(
+                f"fecha_inicio: {stats['started_date_str'] if stats['started_date_str'] != '—' else ''}"
+            )
+        lines.append(f"finished: {body_finished_str}")
+        if not is_en:
+            lines.append(
+                f"fecha_fin: {stats['finished_date_str'] if stats['finished_date_str'] not in ('—', 'En curso') else ''}"
+            )
+        lines.append(f"times_read: {data.get('times_read', 1)}")
+        if not is_en:
+            lines.append(f"Nº Lecturas: {data.get('times_read', 1)}")
+        lines.extend(
+            [
+                f'reading_time: "{stats["total_time_human"]}"',
+                f"sessions_count: {stats['session_count']}",
+                f"rating: {data.get('rating', 0)}",
+            ]
+        )
+        if not is_en:
+            lines.append(f"calificacion: {data.get('rating', 0) if data.get('rating') else ''}")
+
+        if pair_ctx:
+            partner_note_esc = pair_ctx["partner_obsidian_note"].replace(chr(34), chr(39))
+            lines.append(f'paired_edition: "[[{partner_note_esc}]]"')
+            lines.append(f"paired_language: {pair_ctx['paired_book_lang']}")
+
+        lines.append("tags:")
+        if is_en:
+            lines.extend(["  - books", "  - reading", "  - vozlectura"])
+            if pair_ctx:
+                lines.append("  - bilingual-reading")
+        else:
+            lines.extend(["  - libros", "  - lectura", "  - vozlectura"])
+            if pair_ctx:
+                lines.append("  - lectura-bilingue")
+
+        lines.extend(["---", "", f"# 📖 {title}"])
+        if is_en:
+            lines.append(
+                f"**Author:** {author} | **Language:** `{lang}` | **Status:** {status_str}"
+            )
+        else:
+            lines.append(
+                f"**Autor:** {author} | **Idioma:** `{lang}` | **Estado:** {status_str}"
+            )
+
+        if pair_ctx:
+            p_note = pair_ctx["partner_obsidian_note"]
+            p_lang = pair_ctx["paired_book_lang"]
+            p_time = pair_ctx["partner_time_human"]
+            lines.append("")
+            if is_en:
+                lines.extend(
+                    [
+                        "> [!abstract] 🌐 Paired Bilingual Edition (EN ⇄ ES)",
+                        f"> Same book in another language: **[[{p_note}]]** (`{p_lang}`)",
+                        f"> **Reading time:** {stats['total_time_human']} (`{lang}`) · {p_time} (`{p_lang}`)",
+                    ]
+                )
+            else:
+                lines.extend(
+                    [
+                        "> [!abstract] 🌐 Edición Bilingüe Emparejada (ES ⇄ EN)",
+                        f"> Mismo libro en otro idioma: **[[{p_note}]]** (`{p_lang}`)",
+                        f"> **Tiempo de lectura:** {stats['total_time_human']} (`{lang}`) · {p_time} (`{p_lang}`)",
+                    ]
+                )
+
+        lines.append("")
+        if is_en:
+            lines.extend(
+                [
+                    "## 📊 Reading Habits Log",
+                    f"- **Started:** {stats['started_date_str']}",
+                    f"- **Finished:** {body_finished_str}",
+                    f"- **Times read:** {data.get('times_read', 1)}",
+                    f"- **Total reading/listening time:** {stats['total_time_human']} ({stats['session_count']} sessions across {stats['days_read_count']} days)",
+                    f"- **Rating:** {stars}",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "## 📊 Registro de Hábitos de Lectura",
+                    f"- **Fecha de inicio:** {stats['started_date_str']}",
+                    f"- **Fecha de finalización:** {body_finished_str}",
+                    f"- **Veces leído:** {data.get('times_read', 1)}",
+                    f"- **Tiempo total de lectura/escucha:** {stats['total_time_human']} ({stats['session_count']} sesiones en {stats['days_read_count']} días)",
+                    f"- **Valoración:** {stars}",
+                    "",
+                ]
+            )
 
         # Notas generales del libro (siempre visible para edición bidireccional con Obsidian)
         gen_notes = (data.get("general_notes") or "").strip()
-        lines.extend(
-            [
-                "## 💭 Notas Generales y Reflexiones",
-                gen_notes
-                if gen_notes
-                else "_Escribe aquí tus notas, ideas o reflexiones (en la app o directamente en Obsidian)..._",
-                "",
-            ]
-        )
+        if is_en:
+            lines.extend(
+                [
+                    "## 💭 General Notes & Reflections",
+                    gen_notes
+                    if gen_notes
+                    else "_Write your general notes, ideas, or reflections here (in the app or directly in Obsidian)..._",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "## 💭 Notas Generales y Reflexiones",
+                    gen_notes
+                    if gen_notes
+                    else "_Escribe aquí tus notas, ideas o reflexiones (en la app o directamente en Obsidian)..._",
+                    "",
+                ]
+            )
 
         # Mapas e ilustraciones extraídos del EPUB (desplegable abierto por defecto)
         illustrations = data.get("epub_illustrations") or []
         if illustrations:
-            lines.append(f"## 🗺️ Mapas e Ilustraciones ({len(illustrations)})")
-            lines.append(f"> [!info]+ 🗺️ Mapas e ilustraciones del libro ({len(illustrations)})")
+            if is_en:
+                lines.append(f"## 🗺️ Maps & Illustrations ({len(illustrations)})")
+                lines.append(
+                    f"> [!info]+ 🗺️ Book maps & illustrations ({len(illustrations)})"
+                )
+            else:
+                lines.append(f"## 🗺️ Mapas e Ilustraciones ({len(illustrations)})")
+                lines.append(
+                    f"> [!info]+ 🗺️ Mapas e ilustraciones del libro ({len(illustrations)})"
+                )
             for idx_ill, ill in enumerate(illustrations, start=1):
                 ill_fn = (ill.get("filename") or "").strip()
                 if not ill_fn:
                     continue
-                ill_lbl = (ill.get("label") or f"Ilustración {idx_ill}").strip()
+                default_ill_lbl = (
+                    f"Illustration {idx_ill}" if is_en else f"Ilustración {idx_ill}"
+                )
+                ill_lbl = (ill.get("label") or default_ill_lbl).strip()
                 lines.append(f"> **{idx_ill}. {ill_lbl}**")
                 lines.append(f"> ![[{ill_fn}]]")
                 if idx_ill < len(illustrations):
@@ -1238,9 +1805,16 @@ class BookStudyStore:
 
         # Pasajes resaltados y notas
         highlights = data.get("highlights") or []
-        lines.append(f"## 🖍️ Pasajes Resaltados y Notas ({len(highlights)})")
+        if is_en:
+            lines.append(f"## 🖍️ Highlighted Passages & Notes ({len(highlights)})")
+        else:
+            lines.append(f"## 🖍️ Pasajes Resaltados y Notas ({len(highlights)})")
         if not highlights:
-            lines.append("_Aún no hay pasajes resaltados en este libro._\n")
+            lines.append(
+                "_No highlighted passages in this book yet._\n"
+                if is_en
+                else "_Aún no hay pasajes resaltados en este libro._\n"
+            )
         else:
             lines.append("")
             # Ordenar por capítulo y fecha
@@ -1255,22 +1829,37 @@ class BookStudyStore:
                 ),
             )
             for h in sorted_hl:
-                ch_label = h.get("chapter_title") or f"Capítulo {int(h.get('chapter_index') or 0) + 1}"
+                ch_num_hl = int(h.get("chapter_index") or 0) + 1
+                ch_label = h.get("chapter_title") or (
+                    f"Chapter {ch_num_hl}" if is_en else f"Capítulo {ch_num_hl}"
+                )
                 date_str = _format_ts_datetime(h.get("created_at"))
                 lines.append(f"### 📍 {ch_label} _({date_str})_")
-                lines.append(f"> [!quote] Pasaje resaltado")
+                lines.append(
+                    "> [!quote] Highlighted passage"
+                    if is_en
+                    else "> [!quote] Pasaje resaltado"
+                )
                 for q_line in (h.get("text") or "").splitlines():
                     lines.append(f"> {q_line}")
                 lines.append("")
                 if h.get("note"):
-                    lines.append(f"**📝 Nota:** {h['note']}")
+                    note_lbl = "**📝 Note:**" if is_en else "**📝 Nota:**"
+                    lines.append(f"{note_lbl} {h['note']}")
                     lines.append("")
 
         # Vocabulario buscado y subrayado
         vocab = data.get("vocabulary") or []
-        lines.append(f"## 📚 Vocabulario y Palabras Subrayadas ({len(vocab)})")
+        if is_en:
+            lines.append(f"## 📚 Vocabulary & Underlined Words ({len(vocab)})")
+        else:
+            lines.append(f"## 📚 Vocabulario y Palabras Subrayadas ({len(vocab)})")
         if not vocab:
-            lines.append("_Aún no hay palabras guardadas en el vocabulario de este libro._\n")
+            lines.append(
+                "_No vocabulary words saved yet for this book._\n"
+                if is_en
+                else "_Aún no hay palabras guardadas en el vocabulario de este libro._\n"
+            )
         else:
             lines.append("")
             for v in vocab:
@@ -1278,28 +1867,54 @@ class BookStudyStore:
                 phon = f" `/{v['phonetic']}/`" if v.get("phonetic") else ""
                 trans = v.get("translation") or "—"
                 count = int(v.get("lookup_count") or 1)
-                ch_label = v.get("chapter_title") or f"Cap. {int(v.get('chapter_index') or 0) + 1}"
-                lines.append(
-                    f"- **{w}**{phon} → **{trans}** _(consultada {count} {'vez' if count == 1 else 'veces'} • {ch_label})_"
+                ch_num_v = int(v.get("chapter_index") or 0) + 1
+                ch_label = v.get("chapter_title") or (
+                    f"Ch. {ch_num_v}" if is_en else f"Cap. {ch_num_v}"
                 )
-                if v.get("definitions_summary"):
-                    lines.append(f"  - *Definición:* {v['definitions_summary']}")
-                if v.get("context_sentence"):
-                    lines.append(f'  - *Contexto en el libro:* «{v["context_sentence"]}»')
-                if v.get("context_translation"):
-                    lines.append(f'  - *Traducción del contexto:* «{v["context_translation"]}»')
-                if v.get("user_note"):
-                    lines.append(f"  - *Nota personal:* {v['user_note']}")
+                if is_en:
+                    lines.append(
+                        f"- **{w}**{phon} → **{trans}** _(looked up {count} {'time' if count == 1 else 'times'} • {ch_label})_"
+                    )
+                    if v.get("definitions_summary"):
+                        lines.append(f"  - *Definition:* {v['definitions_summary']}")
+                    if v.get("context_sentence"):
+                        lines.append(f'  - *Context in book:* «{v["context_sentence"]}»')
+                    if v.get("context_translation"):
+                        lines.append(f'  - *Context translation:* «{v["context_translation"]}»')
+                    if v.get("user_note"):
+                        lines.append(f"  - *Personal note:* {v['user_note']}")
+                else:
+                    lines.append(
+                        f"- **{w}**{phon} → **{trans}** _(consultada {count} {'vez' if count == 1 else 'veces'} • {ch_label})_"
+                    )
+                    if v.get("definitions_summary"):
+                        lines.append(f"  - *Definición:* {v['definitions_summary']}")
+                    if v.get("context_sentence"):
+                        lines.append(f'  - *Contexto en el libro:* «{v["context_sentence"]}»')
+                    if v.get("context_translation"):
+                        lines.append(f'  - *Traducción del contexto:* «{v["context_translation"]}»')
+                    if v.get("user_note"):
+                        lines.append(f"  - *Nota personal:* {v['user_note']}")
             lines.append("")
 
         # Historial de Sesiones de Lectura
         sessions = data.get("sessions") or []
-        lines.append(f"## ⏱️ Historial de Sesiones de Lectura ({len(sessions)})")
+        if is_en:
+            lines.append(f"## ⏱️ Reading Sessions History ({len(sessions)})")
+        else:
+            lines.append(f"## ⏱️ Historial de Sesiones de Lectura ({len(sessions)})")
         if not sessions:
-            lines.append("_Aún no se han registrado sesiones de lectura._\n")
+            lines.append(
+                "_No reading sessions recorded yet._\n"
+                if is_en
+                else "_Aún no se han registrado sesiones de lectura._\n"
+            )
         else:
             lines.append("")
-            lines.append("| Fecha | Hora inicio | Duración | Capítulos | Frases | Nota |")
+            if is_en:
+                lines.append("| Date | Start time | Duration | Chapters | Sentences | Note |")
+            else:
+                lines.append("| Fecha | Hora inicio | Duración | Capítulos | Frases | Nota |")
             lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
             for s in sessions:
                 d_str = _format_ts_date(s.get("started_at"))
@@ -1311,7 +1926,10 @@ class BookStudyStore:
                 dur_str = _format_duration_human(int(s.get("duration_seconds") or 0))
                 sc = int(s.get("start_chapter") or 0) + 1
                 ec = int(s.get("end_chapter") or 0) + 1
-                ch_range = f"Cap. {sc}" if sc == ec else f"Cap. {sc} → {ec}"
+                ch_prefix = "Ch." if is_en else "Cap."
+                ch_range = (
+                    f"{ch_prefix} {sc}" if sc == ec else f"{ch_prefix} {sc} → {ec}"
+                )
                 if s.get("chapter_title"):
                     ch_range += f" ({s['chapter_title']})"
                 fr_count = int(s.get("sentences_read") or 0)
@@ -1451,14 +2069,39 @@ class BookStudyStore:
             authors_map: Dict[str, Dict[str, Any]] = {}
             years_set = {current_year}
 
+            archived_map = self._load_archived_books_map()
             all_book_ids = list(library_books.keys())
+            seen_ids = set(all_book_ids)
             if self.books_dir.exists():
                 for d in self.books_dir.iterdir():
-                    if d.is_dir() and d.name not in library_books and (d / "metadata.json").exists():
+                    if d.is_dir() and d.name not in seen_ids and (d / "metadata.json").exists():
                         all_book_ids.append(d.name)
+                        seen_ids.add(d.name)
+            for arch_id in archived_map.keys():
+                if arch_id not in seen_ids:
+                    all_book_ids.append(arch_id)
+                    seen_ids.add(arch_id)
+            if self.study_records_dir.exists():
+                for sf_item in self.study_records_dir.glob("*.json"):
+                    bid = sf_item.stem
+                    if bid in seen_ids:
+                        continue
+                    try:
+                        s_raw = json.loads(sf_item.read_text(encoding="utf-8"))
+                        has_meaningful = bool(
+                            (s_raw.get("title") and s_raw.get("title") != bid)
+                            or s_raw.get("sessions")
+                            or float(s_raw.get("rating") or 0) > 0
+                        )
+                        if has_meaningful:
+                            all_book_ids.append(bid)
+                            seen_ids.add(bid)
+                    except Exception:
+                        pass
 
             for book_id in all_book_ids:
-                lib_b = library_books.get(book_id) or self._get_book_meta(book_id)
+                is_archived = book_id not in library_books
+                lib_b = library_books.get(book_id) or archived_map.get(book_id) or self._get_book_meta(book_id)
                 study = self._load_unlocked(book_id)
                 enriched = self._enrich_stats(study)
                 st_stats = enriched["stats"]
@@ -1467,7 +2110,9 @@ class BookStudyStore:
                 title = lib_b.get("title") or study.get("title") or book_id
                 author = (lib_b.get("author") or study.get("author") or "Autor desconocido").strip() or "Autor desconocido"
                 lang = lib_b.get("language") or study.get("language") or "es"
-                cover_url = lib_b.get("cover_url") or (f"/api/books/{book_id}/cover" if (self.books_dir / book_id / "cover.jpg").exists() else None)
+                has_disk_cover = any((self.books_dir / book_id).glob("cover.*")) if (self.books_dir / book_id).exists() else False
+                has_arch_cover = any(self.archived_covers_dir.glob(f"{book_id}.*")) if self.archived_covers_dir.exists() else False
+                cover_url = lib_b.get("cover_url") or (f"/api/books/{book_id}/cover" if (has_disk_cover or has_arch_cover) else None)
                 total_sentences = int(lib_b.get("total_sentences") or sum(length_info["chapter_sentence_counts"]) or 1)
                 chapter_count = int(lib_b.get("chapter_count") or len(length_info["chapter_sentence_counts"]) or 1)
 
@@ -1618,6 +2263,7 @@ class BookStudyStore:
                     "highlights_count": int(st_stats.get("highlights_count") or 0),
                     "vocabulary_count": int(st_stats.get("vocabulary_count") or 0),
                     "general_notes": study.get("general_notes") or "",
+                    "is_archived": is_archived,
                 }
                 books_summary.append(book_record)
 
@@ -1655,6 +2301,7 @@ class BookStudyStore:
                     "reading_status": reading_status,
                     "estimated_pages": estimated_pages,
                     "total_time_human": _format_duration_human(total_sec),
+                    "is_archived": is_archived,
                 })
 
             # Finalizar estructura de daily_map

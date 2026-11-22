@@ -1,4 +1,5 @@
-const CACHE_NAME = "vozlectura-pwa-1.0.2";
+const CACHE_NAME = "vozlectura-pwa-1.1.0";
+const ASSETS_CACHE_NAME = "vozlectura-book-assets-v1";
 const STATIC_ASSETS = [
   "/",
   "/index.html",
@@ -40,7 +41,11 @@ self.addEventListener("install", (event) => {
 self.addEventListener("activate", (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(
+        keys
+          .filter((k) => k !== CACHE_NAME && k !== ASSETS_CACHE_NAME)
+          .map((k) => caches.delete(k))
+      )
     )
   );
   self.clients.claim();
@@ -109,18 +114,20 @@ self.addEventListener("fetch", (event) => {
     return;
   }
 
-  // Portadas e imágenes del EPUB: Cache-First con actualización rápida
+  // Portadas e imágenes del EPUB: Cache-First persistente entre actualizaciones de la PWA
   event.respondWith(
     (async () => {
-      const cache = await caches.open(CACHE_NAME);
-      const cached = await cache.match(event.request, { ignoreSearch: true });
+      const assetsCache = await caches.open(ASSETS_CACHE_NAME);
+      const cached =
+        (await assetsCache.match(event.request, { ignoreSearch: true })) ||
+        (await caches.match(event.request, { ignoreSearch: true }));
       if (cached) {
         return cached;
       }
       try {
-        const networkResp = await fetchWithTimeout(event.request, 2500);
+        const networkResp = await fetchWithTimeout(event.request, 4000);
         if (networkResp && networkResp.status === 200) {
-          cache.put(event.request, networkResp.clone());
+          assetsCache.put(event.request, networkResp.clone());
         }
         return networkResp;
       } catch (_) {

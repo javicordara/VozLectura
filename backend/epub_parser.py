@@ -188,6 +188,7 @@ class EpubParser:
             smil_by_xhtml = self._extract_smil_overlays(zf, manifest)
 
             chapters: List[Dict[str, Any]] = []
+            pending_image_blocks: List[str] = []
             for idx, href in enumerate(spine_hrefs):
                 if href not in zf.namelist():
                     # Intentar decodificar URL (%20, etc.)
@@ -217,11 +218,25 @@ class EpubParser:
                     smil_pars=chapter_smil_pars,
                 )
 
-                # Omitir páginas totalmente vacías o sin texto legible
+                # Si la página no tiene texto pero sí ilustraciones (láminas/mapas entre capítulos),
+                # conservar sus imágenes adjuntándolas al capítulo contiguo sin alterar los índices.
                 if parsed_chapter["sentence_count"] == 0:
+                    img_soup = BeautifulSoup(parsed_chapter.get("html") or "", "html.parser")
+                    imgs = img_soup.find_all("img")
+                    if imgs and not (len(chapters) == 0 and idx == 0 and cover_rel_path):
+                        for im in imgs:
+                            pending_image_blocks.append(f'<p class="epub-image-block">{str(im)}</p>')
                     continue
 
+                if pending_image_blocks:
+                    parsed_chapter["html"] = "".join(pending_image_blocks) + (parsed_chapter.get("html") or "")
+                    pending_image_blocks.clear()
+
                 chapters.append(parsed_chapter)
+
+            if pending_image_blocks and chapters:
+                chapters[-1]["html"] = (chapters[-1].get("html") or "") + "".join(pending_image_blocks)
+                pending_image_blocks.clear()
 
             # Si el EPUB tenía Media Overlays integrados, extraer y cortar directamente sus audios sin recalcular nada
             embedded_overlay_count = 0
@@ -749,14 +764,21 @@ class EpubParser:
         body = soup.find("body") or soup
 
         # Reescribir rutas de imágenes para que apunten a /api/books/{book_id}/assets/...
-        for img in body.find_all(["img", "image"]):
+        for img in list(body.find_all(["img", "image"])):
             src_attr = "src" if img.name == "img" else "xlink:href"
             raw_src = img.get(src_attr) or img.get("href") or img.get("src")
             if raw_src and not raw_src.startswith(("http://", "https://", "data:")):
                 norm_img = posixpath.normpath(posixpath.join(chapter_dir, raw_src)) if chapter_dir else raw_src
-                img["src"] = f"/api/books/{book_id}/assets/{norm_img}"
+                img_src = f"/api/books/{book_id}/assets/{norm_img}"
                 if img.name == "image":
-                    img.name = "img"
+                    new_img = soup.new_tag("img", attrs={"src": img_src, "alt": img.get("alt", ""), "class": "epub-illustration"})
+                    svg_parent = img.find_parent("svg")
+                    if svg_parent and not svg_parent.get_text(strip=True):
+                        svg_parent.replace_with(new_img)
+                    else:
+                        img.replace_with(new_img)
+                else:
+                    img["src"] = img_src
 
         # Detectar título del capítulo
         detected_title = fallback_title
@@ -831,37 +853,42 @@ class EpubParser:
 
         # MODO 2: Capítulo estándar (segmentación automática en frases)
         if not used_smil_mode:
-            # Bloques de texto candidatos
-            block_tags = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "dt", "dd", "figcaption"}
+            # Bloques de texto o imagen candidatos
+            block_tags = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "dt", "dd", "figcaption", "figure"}
 
             def has_nested_block(el: Tag) -> bool:
                 return any(child.name in block_tags for child in el.find_all(block_tags))
 
-            # Recorrer bloques hoja o contenedores con texto
+            # Recorrer bloques hoja o contenedores con texto o imágenes
             candidates: List[Tag] = []
             for el in body.find_all(list(block_tags) + ["div", "section", "article"]):
                 if el.name in block_tags and not has_nested_block(el):
                     candidates.append(el)
                 elif el.name in {"div", "section", "article"} and not el.find(list(block_tags) + ["div", "section", "article"]):
-                    if el.get_text(strip=True):
+                    if el.get_text(strip=True) or el.find("img"):
                         candidates.append(el)
 
             # Si el capítulo tiene texto plano directo en body sin etiquetas p/div
-            if not candidates and body.get_text(strip=True):
+            if not candidates and (body.get_text(strip=True) or body.find("img")):
                 candidates = [body]
 
             for block in candidates:
-                block_text = block.get_text(" ", strip=True)
-                if not block_text:
-                    continue
-
-                block_sentences = split_into_sentences(block_text)
-                if not block_sentences:
-                    continue
-
-                # Preservar imágenes si las hubiera dentro del bloque
+                # Preservar imágenes si las hubiera dentro del bloque (con o sin texto)
                 preserved_imgs = [img.extract() for img in block.find_all("img")]
+                block_text = block.get_text(" ", strip=True)
+                block_sentences = split_into_sentences(block_text) if block_text else []
+
+                if not block_sentences and not preserved_imgs:
+                    continue
+
                 block.clear()
+                if not block_sentences and preserved_imgs:
+                    existing_cls = block.get("class") or []
+                    if isinstance(existing_cls, str):
+                        existing_cls = existing_cls.split()
+                    if "epub-image-block" not in existing_cls:
+                        existing_cls.append("epub-image-block")
+                    block["class"] = existing_cls
 
                 for img in preserved_imgs:
                     block.append(img)
@@ -906,6 +933,8 @@ class EpubParser:
                 allowed_attrs["src"] = tag["src"]
                 allowed_attrs["alt"] = tag.get("alt", "")
                 allowed_attrs["class"] = "epub-illustration"
+            elif "epub-image-block" in classes:
+                allowed_attrs["class"] = "epub-image-block"
             tag.attrs = allowed_attrs
 
         inner_html = "".join(str(child) for child in body.contents)
@@ -1027,3 +1056,98 @@ class EpubParser:
         if en_score > es_score * 1.3:
             return metadata_lang if metadata_lang.startswith("en") else "en-US"
         return metadata_lang
+
+    def refresh_book_images_from_epub(self, book_id: str) -> Dict[str, Any]:
+        """
+        Re-extrae imágenes y actualiza el HTML de chapters.json desde book.epub para libros ya importados,
+        preservando exactamente los índices de capítulo, frases (sent-N), audios cacheados y progreso.
+        """
+        book_folder = self.books_dir / book_id
+        epub_path = book_folder / "book.epub"
+        chapters_path = book_folder / "chapters.json"
+        if not epub_path.exists() or not chapters_path.exists():
+            return {"ok": False, "updated_chapters": 0}
+
+        existing_chapters = json.loads(chapters_path.read_text(encoding="utf-8"))
+        assets_folder = book_folder / "assets"
+        assets_folder.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            opf_path = self._find_opf_path(zf)
+            opf_dir = posixpath.dirname(opf_path)
+            opf_root = ET.fromstring(zf.read(opf_path))
+
+            manifest, id_to_href = self._extract_manifest(opf_root, opf_dir)
+            spine_hrefs = self._extract_spine(opf_root, id_to_href)
+            toc_map = self._extract_toc(zf, opf_root, manifest, opf_dir)
+            self._extract_images(zf, manifest, assets_folder)
+
+            has_cover_file = any(book_folder.glob("cover.*"))
+            cover_rel_path = None
+            if not has_cover_file:
+                cover_rel_path = self._extract_cover(zf, opf_root, manifest, book_folder)
+            else:
+                cover_rel_path = next(book_folder.glob("cover.*")).name
+
+            smil_by_xhtml = self._extract_smil_overlays(zf, manifest)
+
+            reparsed_chapters: List[Dict[str, Any]] = []
+            pending_image_blocks: List[str] = []
+            for idx, href in enumerate(spine_hrefs):
+                if href not in zf.namelist():
+                    decoded_href = urllib.parse.unquote(href)
+                    if decoded_href in zf.namelist():
+                        href = decoded_href
+                    else:
+                        continue
+                raw_html = zf.read(href).decode("utf-8", errors="replace")
+                chapter_dir = posixpath.dirname(href)
+                chapter_title = toc_map.get(href) or toc_map.get(urllib.parse.unquote(href))
+                chapter_smil_pars = (
+                    smil_by_xhtml.get(href)
+                    or smil_by_xhtml.get(urllib.parse.unquote(href))
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(href)}")
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(urllib.parse.unquote(href))}")
+                    or []
+                )
+                parsed_chapter = self._parse_chapter_html(
+                    raw_html=raw_html,
+                    chapter_index=len(reparsed_chapters),
+                    chapter_dir=chapter_dir,
+                    book_id=book_id,
+                    fallback_title=chapter_title,
+                    smil_pars=chapter_smil_pars,
+                )
+                if parsed_chapter["sentence_count"] == 0:
+                    img_soup = BeautifulSoup(parsed_chapter.get("html") or "", "html.parser")
+                    imgs = img_soup.find_all("img")
+                    if imgs and not (len(reparsed_chapters) == 0 and idx == 0 and cover_rel_path):
+                        for im in imgs:
+                            pending_image_blocks.append(f'<p class="epub-image-block">{str(im)}</p>')
+                    continue
+                if pending_image_blocks:
+                    parsed_chapter["html"] = "".join(pending_image_blocks) + (parsed_chapter.get("html") or "")
+                    pending_image_blocks.clear()
+                reparsed_chapters.append(parsed_chapter)
+
+            if pending_image_blocks and reparsed_chapters:
+                reparsed_chapters[-1]["html"] = (reparsed_chapters[-1].get("html") or "") + "".join(pending_image_blocks)
+                pending_image_blocks.clear()
+
+        updated_count = 0
+        if len(reparsed_chapters) == len(existing_chapters):
+            for old_ch, new_ch in zip(existing_chapters, reparsed_chapters):
+                if int(old_ch.get("sentence_count", 0)) == int(new_ch.get("sentence_count", 0)):
+                    if old_ch.get("html") != new_ch.get("html"):
+                        old_ch["html"] = new_ch["html"]
+                        updated_count += 1
+            if updated_count > 0:
+                chapters_path.write_text(
+                    json.dumps(existing_chapters, ensure_ascii=False), encoding="utf-8"
+                )
+
+        return {
+            "ok": True,
+            "updated_chapters": updated_count,
+            "cover_url": f"/api/books/{book_id}/cover" if cover_rel_path else None,
+        }

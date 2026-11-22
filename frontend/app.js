@@ -1,12 +1,13 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.0.0";
+  const APP_VERSION = "1.1.0";
   const ACTIVE_PORT = (window.location && window.location.port) ? window.location.port : "8085";
   const DEFAULT_STATIC_SERVER_URL = `http://localhost:${ACTIVE_PORT}`;
 
   const state = {
     books: [],
+    archivedBooks: [],
     voices: [],
     currentBook: null,
     currentChapter: null,
@@ -14,6 +15,12 @@
     sentenceIndex: 0,
     isPlaying: false,
     isLoadingAudio: false,
+    readerUiMode: "reading",
+    abShowSubtitle: false,
+    sleepTimerMode: "off",
+    sleepTimerEndMs: 0,
+    ttsUpdatesData: null,
+    ttsUpdatesNotified: false,
     selectedVoice: "piper:es_ES-davefx-medium",
     speed: 1.0,
     autoScroll: true,
@@ -129,8 +136,8 @@
   }
 
   /**
-   * Recorta el silencio digital inicial y final en archivos WAV PCM de 16 bits.
-   * Evita que los 150-350ms de cola muda de cada frase se sumen a la latencia del buffer Bluetooth A2DP del coche.
+   * Recorta el silencio adaptativo inicial/final por energía RMS y compacta pausas internas largas en Modo Coche.
+   * Evita colas de respiración/ruido de sala y alinea la fluidez entre idiomas en Bluetooth A2DP.
    */
   function createTrimmedWavBlobUrl(rawBytes, gapMode = getEffectiveSentenceGapMode()) {
     try {
@@ -182,40 +189,111 @@
         return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
       }
 
-      // Umbral de energía de voz (~ -38.5 dBFS) para descartar ruido de fondo o respiración muda del sintetizador
-      const threshold = 390;
-      let firstActiveFrame = 0;
-      let lastActiveFrame = totalFrames - 1;
-
-      for (let f = 0; f < totalFrames; f++) {
-        const sample = view.getInt16(dataOffset + f * bytesPerFrame, true);
-        if (sample > threshold || sample < -threshold) {
-          firstActiveFrame = f;
-          break;
-        }
-      }
-
-      for (let f = totalFrames - 1; f > firstActiveFrame; f--) {
-        const sample = view.getInt16(dataOffset + f * bytesPerFrame, true);
-        if (sample > threshold || sample < -threshold) {
-          lastActiveFrame = f;
-          break;
-        }
-      }
-
-      // Margen de seguridad (en ms) al inicio y al final de cada frase según modo elegido
-      const leadPadMs = resolvedMode === "car" ? 8 : 22;
-      const trailPadMs = resolvedMode === "car" ? 18 : 58;
-      const leadPadFrames = Math.floor((sampleRate * leadPadMs) / 1000);
-      const trailPadFrames = Math.floor((sampleRate * trailPadMs) / 1000);
-
-      const startFrame = Math.max(0, firstActiveFrame - leadPadFrames);
-      const endFrame = Math.min(totalFrames - 1, lastActiveFrame + trailPadFrames);
-      if (endFrame <= startFrame || (startFrame === 0 && endFrame >= totalFrames - 1)) {
+      // Energía RMS por ventanas de 10 ms para distinguir voz real de respiración o ruido de sala
+      const winFrames = Math.max(1, Math.floor(sampleRate * 0.01));
+      const numWins = Math.floor(totalFrames / winFrames);
+      if (numWins < 12) {
         return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
       }
 
-      const keptDataBytes = (endFrame - startFrame + 1) * bytesPerFrame;
+      const rms = new Float32Array(numWins);
+      const totalSamplesInWin = winFrames * numChannels;
+      for (let w = 0; w < numWins; w++) {
+        let sumSq = 0;
+        const winSampleStart = dataOffset + w * winFrames * bytesPerFrame;
+        for (let s = 0; s < totalSamplesInWin; s++) {
+          const val = view.getInt16(winSampleStart + s * 2, true);
+          sumSq += val * val;
+        }
+        rms[w] = Math.sqrt(sumSq / totalSamplesInWin);
+      }
+
+      const sortedRms = Float32Array.from(rms).sort();
+      const p10 = sortedRms[Math.floor(numWins * 0.10)];
+      const p85 = sortedRms[Math.floor(numWins * 0.85)];
+
+      // Umbral adaptativo para recortar bordes (ignora respiraciones suaves / suelo de ruido)
+      const edgeThresh = Math.max(145, p10 * 2.8, p85 * 0.045);
+      let firstWin = -1;
+      let lastWin = -1;
+      for (let w = 0; w < numWins; w++) {
+        if (rms[w] > edgeThresh) {
+          if (firstWin < 0) firstWin = w;
+          lastWin = w;
+        }
+      }
+      if (firstWin < 0) {
+        return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
+      }
+
+      // Margen de seguridad (en ms) al inicio y al final de cada frase según modo elegido
+      const leadPadMs = resolvedMode === "car" ? 10 : 22;
+      const trailPadMs = resolvedMode === "car" ? 20 : 58;
+      const startFrame = Math.max(0, firstWin * winFrames - Math.floor((sampleRate * leadPadMs) / 1000));
+      const endFrame = Math.min(
+        totalFrames - 1,
+        (lastWin + 1) * winFrames + Math.floor((sampleRate * trailPadMs) / 1000)
+      );
+      if (endFrame <= startFrame) {
+        return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
+      }
+
+      // Compactar silencios internos largos (>260 ms -> ~150 ms) solo en Modo Coche
+      const crossfadeFrames = Math.max(1, Math.floor(sampleRate * 0.01));
+      const segments = [];
+      if (resolvedMode === "car" && lastWin - firstWin > 32) {
+        const interiorSilThresh = Math.max(115, p10 * 2.3, p85 * 0.035);
+        const maxPauseWins = 26;
+        const keepBeforeWins = 8;
+        const keepAfterWins = 7;
+        let curSegStart = startFrame;
+
+        let w = firstWin;
+        while (w <= lastWin) {
+          if (rms[w] < interiorSilThresh) {
+            const silStartW = w;
+            while (w <= lastWin && rms[w] < interiorSilThresh) {
+              w++;
+            }
+            const silEndW = w;
+            if (silEndW - silStartW > maxPauseWins) {
+              const segEnd = Math.min(
+                endFrame + 1,
+                (silStartW + keepBeforeWins) * winFrames + crossfadeFrames
+              );
+              const nextStart = (silEndW - keepAfterWins) * winFrames;
+              if (
+                segEnd - curSegStart >= crossfadeFrames * 2 &&
+                nextStart >= segEnd &&
+                endFrame + 1 - nextStart >= crossfadeFrames * 2
+              ) {
+                segments.push([curSegStart, segEnd]);
+                curSegStart = nextStart;
+              }
+            }
+          } else {
+            w++;
+          }
+        }
+        segments.push([curSegStart, endFrame + 1]);
+      } else {
+        segments.push([startFrame, endFrame + 1]);
+      }
+
+      if (segments.length === 1 && segments[0][0] === 0 && segments[0][1] >= totalFrames) {
+        return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
+      }
+
+      let outFrames = 0;
+      for (let i = 0; i < segments.length; i++) {
+        outFrames += segments[i][1] - segments[i][0];
+        if (i > 0) outFrames -= crossfadeFrames;
+      }
+      if (outFrames <= 0) {
+        return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
+      }
+
+      const keptDataBytes = outFrames * bytesPerFrame;
       const outBuffer = new ArrayBuffer(44 + keptDataBytes);
       const outView = new DataView(outBuffer);
       const outBytes = new Uint8Array(outBuffer);
@@ -235,8 +313,67 @@
       outView.setUint32(36, 0x64617461, false); // "data"
       outView.setUint32(40, keptDataBytes, true);
 
-      const srcStart = dataOffset + startFrame * bytesPerFrame;
-      outBytes.set(rawBytes.subarray(srcStart, srcStart + keptDataBytes), 44);
+      // Copiar primer segmento y ensamblar los siguientes con crossfade lineal de 10 ms
+      const [seg0Start, seg0End] = segments[0];
+      outBytes.set(
+        rawBytes.subarray(dataOffset + seg0Start * bytesPerFrame, dataOffset + seg0End * bytesPerFrame),
+        44
+      );
+      let writeFrameCursor = seg0End - seg0Start;
+
+      for (let i = 1; i < segments.length; i++) {
+        const [sStart, sEnd] = segments[i];
+        const fadeStartFrame = writeFrameCursor - crossfadeFrames;
+        for (let cf = 0; cf < crossfadeFrames; cf++) {
+          const alpha = (cf + 1) / (crossfadeFrames + 1);
+          const outFrameBase = 44 + (fadeStartFrame + cf) * bytesPerFrame;
+          const srcFrameBase = dataOffset + (sStart + cf) * bytesPerFrame;
+          for (let ch = 0; ch < numChannels; ch++) {
+            const prevS = outView.getInt16(outFrameBase + ch * 2, true);
+            const nextS = view.getInt16(srcFrameBase + ch * 2, true);
+            const mixed = Math.max(
+              -32768,
+              Math.min(32767, Math.round(prevS * (1 - alpha) + nextS * alpha))
+            );
+            outView.setInt16(outFrameBase + ch * 2, mixed, true);
+          }
+        }
+        const remFrames = sEnd - sStart - crossfadeFrames;
+        if (remFrames > 0) {
+          const srcTailStart = dataOffset + (sStart + crossfadeFrames) * bytesPerFrame;
+          const dstTailOffset = 44 + writeFrameCursor * bytesPerFrame;
+          outBytes.set(
+            rawBytes.subarray(srcTailStart, srcTailStart + remFrames * bytesPerFrame),
+            dstTailOffset
+          );
+          writeFrameCursor += remFrames;
+        }
+      }
+
+      // Micro-fundidos en bordes exteriores (6 ms entrada / 12 ms salida) para evitar clics por ruido de fondo
+      const fadeInFrames = Math.min(Math.floor(outFrames / 4), Math.floor(sampleRate * 0.006));
+      if (fadeInFrames > 1) {
+        for (let f = 0; f < fadeInFrames; f++) {
+          const gain = f / fadeInFrames;
+          const fBase = 44 + f * bytesPerFrame;
+          for (let ch = 0; ch < numChannels; ch++) {
+            const smp = outView.getInt16(fBase + ch * 2, true);
+            outView.setInt16(fBase + ch * 2, Math.round(smp * gain), true);
+          }
+        }
+      }
+      const fadeOutFrames = Math.min(Math.floor(outFrames / 4), Math.floor(sampleRate * 0.012));
+      if (fadeOutFrames > 1) {
+        for (let f = 0; f < fadeOutFrames; f++) {
+          const gain = (fadeOutFrames - 1 - f) / fadeOutFrames;
+          const fBase = 44 + (outFrames - fadeOutFrames + f) * bytesPerFrame;
+          for (let ch = 0; ch < numChannels; ch++) {
+            const smp = outView.getInt16(fBase + ch * 2, true);
+            outView.setInt16(fBase + ch * 2, Math.round(smp * gain), true);
+          }
+        }
+      }
+
       return URL.createObjectURL(new Blob([outBytes], { type: "audio/wav" }));
     } catch (_) {
       return URL.createObjectURL(new Blob([rawBytes], { type: "audio/wav" }));
@@ -1143,6 +1280,65 @@
     syncUploadPct: document.getElementById("sync-upload-pct"),
     syncUploadBar: document.getElementById("sync-upload-bar"),
     btnStartAudiobookSync: document.getElementById("btn-start-audiobook-sync"),
+    ttsPlayerBar: document.getElementById("tts-player-bar"),
+    miniPlayerBookBar: document.getElementById("mini-player-book-bar"),
+    miniPlayerOpenBook: document.getElementById("mini-player-open-book"),
+    miniPlayerCover: document.getElementById("mini-player-cover"),
+    miniPlayerCoverFallback: document.getElementById("mini-player-cover-fallback"),
+    miniPlayerTitle: document.getElementById("mini-player-title"),
+    miniPlayerChapter: document.getElementById("mini-player-chapter"),
+    btnMiniOpenAudiobook: document.getElementById("btn-mini-open-audiobook"),
+    btnMiniOpenReading: document.getElementById("btn-mini-open-reading"),
+    btnMiniClosePlayer: document.getElementById("btn-mini-close-player"),
+    btnToggleAudiobookMode: document.getElementById("btn-toggle-audiobook-mode"),
+    btnPlayerAudiobookToggle: document.getElementById("btn-player-audiobook-toggle"),
+    playerSleepBadge: document.getElementById("player-sleep-badge"),
+    audiobookPlayerView: document.getElementById("audiobook-player-view"),
+    abBtnBackLibrary: document.getElementById("ab-btn-back-library"),
+    abBtnBackReading: document.getElementById("ab-btn-back-reading"),
+    abBtnSwitchPaired: document.getElementById("ab-btn-switch-paired"),
+    abBtnOpenToc: document.getElementById("ab-btn-open-toc"),
+    abCoverWrap: document.getElementById("ab-cover-wrap"),
+    abCoverImg: document.getElementById("ab-cover-img"),
+    abCoverFallback: document.getElementById("ab-cover-fallback"),
+    abBookTitle: document.getElementById("ab-book-title"),
+    abBookAuthor: document.getElementById("ab-book-author"),
+    abChapterBtn: document.getElementById("ab-chapter-btn"),
+    abChapterTitle: document.getElementById("ab-chapter-title"),
+    abSubtitleBox: document.getElementById("ab-subtitle-box"),
+    abSubtitleText: document.getElementById("ab-subtitle-text"),
+    abChapterSlider: document.getElementById("ab-chapter-slider"),
+    abChapterProgressMeta: document.getElementById("ab-chapter-progress-meta"),
+    abBookProgressMeta: document.getElementById("ab-book-progress-meta"),
+    abStatusDot: document.getElementById("ab-status-dot"),
+    abStatusText: document.getElementById("ab-status-text"),
+    abBtnBackFast: document.getElementById("ab-btn-back-fast"),
+    abBtnPrevSent: document.getElementById("ab-btn-prev-sent"),
+    abBtnPlayPause: document.getElementById("ab-btn-play-pause"),
+    abIconPlay: document.getElementById("ab-icon-play"),
+    abIconPause: document.getElementById("ab-icon-pause"),
+    abIconLoading: document.getElementById("ab-icon-loading"),
+    abBtnNextSent: document.getElementById("ab-btn-next-sent"),
+    abBtnFwdFast: document.getElementById("ab-btn-fwd-fast"),
+    abBtnPrevChapter: document.getElementById("ab-btn-prev-chapter"),
+    abBtnToggleSubtitle: document.getElementById("ab-btn-toggle-subtitle"),
+    abBtnNextChapter: document.getElementById("ab-btn-next-chapter"),
+    abSpeedPill: document.getElementById("ab-speed-pill"),
+    abSpeedLabel: document.getElementById("ab-speed-label"),
+    abSelectSpeed: document.getElementById("ab-select-speed"),
+    abSleepPill: document.getElementById("ab-sleep-pill"),
+    abSleepLabel: document.getElementById("ab-sleep-label"),
+    abSelectSleepTimer: document.getElementById("ab-select-sleep-timer"),
+    abSleepCountdown: document.getElementById("ab-sleep-countdown"),
+    abBtnCarMode: document.getElementById("ab-btn-car-mode"),
+    abCarModeValue: document.getElementById("ab-car-mode-value"),
+    abVoiceLabel: document.getElementById("ab-voice-label"),
+    abSelectVoice: document.getElementById("ab-select-voice"),
+    ttsUpdatesBadge: document.getElementById("tts-updates-badge"),
+    ttsUpdatesPanel: document.getElementById("tts-updates-panel"),
+    ttsUpdatesSummary: document.getElementById("tts-updates-summary"),
+    ttsUpdatesList: document.getElementById("tts-updates-list"),
+    btnCheckTtsUpdates: document.getElementById("btn-check-tts-updates"),
     toast: document.getElementById("toast"),
   };
 
@@ -1170,6 +1366,14 @@
       if (typeof saved.autoScroll === "boolean") state.autoScroll = saved.autoScroll;
       if (typeof saved.autoFullscreen === "boolean") state.autoFullscreen = saved.autoFullscreen;
       if (typeof saved.immersiveReader === "boolean") state.immersiveReader = saved.immersiveReader;
+      if (saved.readerUiMode === "audiobook" || saved.readerUiMode === "reading") {
+        state.readerUiMode = saved.readerUiMode;
+      }
+      if (!saved.abCleanMigratedV59) {
+        state.abShowSubtitle = false;
+      } else if (typeof saved.abShowSubtitle === "boolean") {
+        state.abShowSubtitle = saved.abShowSubtitle;
+      }
       if (typeof saved.carBluetoothCustomName === "string") {
         state.carBluetoothCustomName = saved.carBluetoothCustomName;
       }
@@ -1206,6 +1410,9 @@
         autoScroll: state.autoScroll,
         autoFullscreen: state.autoFullscreen,
         immersiveReader: state.immersiveReader,
+        readerUiMode: state.readerUiMode,
+        abShowSubtitle: state.abShowSubtitle,
+        abCleanMigratedV59: true,
         sentenceGapMode: state.sentenceGapMode,
         carBluetoothCustomName: state.carBluetoothCustomName || "",
         gapModeAutoMigratedV50: true,
@@ -1357,6 +1564,12 @@
       els.btnQuickCarMode.title = isCarActive
         ? "Modo Coche ACTIVO (Recortes de pausas activados). Pulsa para volver al audio original sin recortes."
         : "Modo Normal ACTIVO (Audiolibro tal cual se genera en la app, sin recortes). Pulsa para activar los recortes de Modo Coche.";
+    }
+    if (els.abBtnCarMode) {
+      els.abBtnCarMode.classList.toggle("is-car-active", isCarActive);
+    }
+    if (els.abCarModeValue) {
+      els.abCarModeValue.textContent = isCarActive ? "🚗 Coche" : "🚗";
     }
   }
 
@@ -1527,7 +1740,9 @@
 
   function applyAppearance() {
     const isReaderOpen = els.readerView && !els.readerView.classList.contains("hidden");
-    const isPaginated = isReaderOpen && state.flowMode === "paginated";
+    const isAudiobook = isReaderOpen && state.readerUiMode === "audiobook";
+    const isPaginated = isReaderOpen && !isAudiobook && state.flowMode === "paginated";
+    const showMiniPlayer = !isReaderOpen && Boolean(state.currentBook);
 
     document.body.classList.remove(
       "theme-light",
@@ -1571,7 +1786,20 @@
     if (els.selectSentenceGap) els.selectSentenceGap.value = state.sentenceGapMode || "auto";
     updateCarModeUi();
 
-    const showImmersive = isReaderOpen && state.immersiveReader;
+    document.body.classList.toggle("reader-open", isReaderOpen);
+    document.body.classList.toggle("mode-audiobook", isAudiobook);
+    document.body.classList.toggle("has-mini-player", showMiniPlayer);
+    if (els.ttsPlayerBar) {
+      els.ttsPlayerBar.classList.toggle("hidden", !state.currentBook || isAudiobook);
+    }
+    if (els.miniPlayerBookBar) {
+      els.miniPlayerBookBar.classList.toggle("hidden", !showMiniPlayer);
+    }
+    if (els.audiobookPlayerView) {
+      els.audiobookPlayerView.classList.toggle("hidden", !isAudiobook);
+    }
+
+    const showImmersive = isReaderOpen && !isAudiobook && state.immersiveReader;
     document.body.classList.toggle("immersive-reader", showImmersive);
     if (els.btnExitImmersive) {
       els.btnExitImmersive.classList.toggle("hidden", !showImmersive);
@@ -1622,9 +1850,10 @@
       btn.classList.toggle("active", btn.dataset.margin === state.marginSize);
     });
 
-    if (isReaderOpen) {
+    if (isReaderOpen && !isAudiobook) {
       requestAnimationFrame(() => updatePaginationLayout(true));
     }
+    syncAudiobookAndMiniPlayerUi();
   }
 
   // Cargar catálogo de voces desde el servidor (con respaldo instantáneo en localStorage para uso sin conexión)
@@ -1736,6 +1965,466 @@
     if ([...els.selectVoice.options].some((o) => o.value === currentVal)) {
       els.selectVoice.value = currentVal;
     }
+    if (els.abSelectVoice) {
+      els.abSelectVoice.innerHTML = els.selectVoice.innerHTML;
+      els.abSelectVoice.value = els.selectVoice.value;
+    }
+  }
+
+  // ============================================================================
+  // ACTUALIZACIONES DE MOTORES TTS, MODO AUDIOLIBRO, SLEEP TIMER Y MINI-PLAYER
+  // ============================================================================
+  function renderTtsUpdatesPanel() {
+    const data = state.ttsUpdatesData;
+    const updCount = Number((data && data.updates_count) || 0);
+    if (els.ttsUpdatesBadge) {
+      if (updCount > 0) {
+        els.ttsUpdatesBadge.textContent = `↑${updCount}`;
+        els.ttsUpdatesBadge.classList.remove("hidden");
+        els.ttsUpdatesBadge.title = `Hay ${updCount} actualización(es) disponible(s) en motores TTS`;
+      } else {
+        els.ttsUpdatesBadge.classList.add("hidden");
+      }
+    }
+    if (!els.ttsUpdatesPanel || !els.ttsUpdatesList || !els.ttsUpdatesSummary) return;
+
+    if (!data || !Array.isArray(data.engines)) {
+      els.ttsUpdatesPanel.classList.remove("has-updates");
+      els.ttsUpdatesSummary.textContent = "Pulsa «Comprobar ahora» para verificar versiones en PyPI.";
+      els.ttsUpdatesList.innerHTML = "";
+      return;
+    }
+
+    els.ttsUpdatesPanel.classList.toggle("has-updates", updCount > 0);
+    const checkedDateStr = data.checked_at
+      ? new Date(data.checked_at * 1000).toLocaleString("es-ES", {
+          day: "2-digit",
+          month: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      : "";
+    if (updCount > 0) {
+      els.ttsUpdatesSummary.textContent = `🆕 Hay ${updCount} motor(es) TTS con nueva versión disponible (revisado ${checkedDateStr}).`;
+    } else if (data.network_ok === false) {
+      els.ttsUpdatesSummary.textContent = "Sin conexión a PyPI para comprobar actualizaciones ahora mismo.";
+    } else {
+      els.ttsUpdatesSummary.textContent = `✓ Todos los motores TTS están al día (revisado ${checkedDateStr}).`;
+    }
+
+    els.ttsUpdatesList.innerHTML = "";
+    for (const eng of data.engines) {
+      const card = document.createElement("div");
+      card.className = `tts-update-card${eng.has_update ? " is-updatable" : ""}`;
+
+      let pillClass = "muted";
+      let pillText = "No instalado";
+      if (eng.status === "update_available") {
+        pillClass = "new";
+        pillText = "Nueva versión";
+      } else if (eng.status === "up_to_date") {
+        pillClass = "ok";
+        pillText = "Al día";
+      } else if (eng.status === "error") {
+        pillClass = "muted";
+        pillText = "Sin comprobar";
+      }
+
+      const instStr = eng.installed_version ? `v${eng.installed_version}` : "—";
+      const latStr = eng.latest_version ? `v${eng.latest_version}` : "—";
+      const verLine = eng.has_update
+        ? `<strong>${escapeHtml(instStr)} → ${escapeHtml(latStr)}</strong>`
+        : `Instalada: <strong>${escapeHtml(instStr)}</strong>`;
+
+      card.innerHTML = `
+        <div class="tts-update-card-top">
+          <strong>${escapeHtml(eng.name || eng.package)}</strong>
+          <span class="tts-update-status-pill ${pillClass}">${pillText}</span>
+        </div>
+        <div class="tts-update-ver-row">
+          <span>${verLine}</span>
+          ${
+            eng.release_url
+              ? `<a href="${escapeHtml(eng.release_url)}" target="_blank" rel="noopener" class="tts-update-link">PyPI ↗</a>`
+              : ""
+          }
+        </div>
+      `;
+      els.ttsUpdatesList.appendChild(card);
+    }
+  }
+
+  async function checkTtsEngineUpdates({ force = false, notifyToast = false } = {}) {
+    if (state.isServerOffline) return null;
+    if (els.btnCheckTtsUpdates) {
+      els.btnCheckTtsUpdates.disabled = true;
+      els.btnCheckTtsUpdates.textContent = "Comprobando...";
+    }
+    try {
+      const url = force ? "/api/tts/updates?force=true" : "/api/tts/updates";
+      const res = await fetchWithTimeout(url, {}, force ? 12000 : 7500);
+      if (!res.ok) return null;
+      const data = await res.json();
+      state.ttsUpdatesData = data;
+      renderTtsUpdatesPanel();
+      if (notifyToast && data.has_updates && !state.ttsUpdatesNotified) {
+        state.ttsUpdatesNotified = true;
+        const names = (data.engines || [])
+          .filter((e) => e.has_update)
+          .map((e) => `${e.name} (${e.latest_version})`)
+          .join(", ");
+        if (names) {
+          showToast(`🆕 Actualización TTS disponible: ${names} — revisa en «Voces IA»`, 6500);
+        }
+      } else if (force) {
+        if (data.has_updates) {
+          showToast(`🆕 ${data.updates_count} actualización(es) de motor TTS disponible(s)`, 4500);
+        } else if (data.network_ok) {
+          showToast("✓ Todos los motores TTS están en su última versión");
+        } else {
+          showToast("⚠️ No se pudo conectar con PyPI para comprobar actualizaciones");
+        }
+      }
+      return data;
+    } catch (_) {
+      return null;
+    } finally {
+      if (els.btnCheckTtsUpdates) {
+        els.btnCheckTtsUpdates.disabled = false;
+        els.btnCheckTtsUpdates.textContent = "Comprobar ahora";
+      }
+    }
+  }
+
+  let sleepTimerInterval = null;
+
+  function formatSleepRemaining(ms) {
+    const totalSec = Math.max(0, Math.ceil(ms / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+  }
+
+  function updateSleepTimerUi() {
+    let label = "";
+    let active = false;
+    if (state.sleepTimerMode === "chapter") {
+      active = true;
+      label = "Fin cap.";
+    } else if (state.sleepTimerMode === "minutes" && state.sleepTimerEndMs > 0) {
+      const rem = state.sleepTimerEndMs - Date.now();
+      if (rem <= 0) {
+        clearSleepTimer();
+        if (state.isPlaying) {
+          stopPlayback();
+        }
+        showToast("🌙 Temporizador de apagado finalizado — Reproducción detenida", 5000);
+        return;
+      }
+      active = true;
+      label = formatSleepRemaining(rem);
+    }
+
+    if (els.abSleepCountdown) {
+      els.abSleepCountdown.textContent = active ? label : "";
+      els.abSleepCountdown.classList.toggle("hidden", !active);
+    }
+    if (els.abSleepPill) {
+      els.abSleepPill.classList.toggle("is-active", active);
+    }
+    if (els.abSleepLabel) {
+      els.abSleepLabel.textContent = active ? `🌙 ${label}` : "🌙";
+    }
+    if (els.playerSleepBadge) {
+      els.playerSleepBadge.textContent = active ? `🌙 ${label}` : "";
+      els.playerSleepBadge.classList.toggle("hidden", !active);
+    }
+    if (els.abSelectSleepTimer && !active && els.abSelectSleepTimer.value !== "off") {
+      els.abSelectSleepTimer.value = "off";
+    }
+  }
+
+  function clearSleepTimer() {
+    if (sleepTimerInterval) {
+      clearInterval(sleepTimerInterval);
+      sleepTimerInterval = null;
+    }
+    state.sleepTimerMode = "off";
+    state.sleepTimerEndMs = 0;
+    if (els.abSelectSleepTimer) els.abSelectSleepTimer.value = "off";
+    updateSleepTimerUi();
+  }
+
+  function setSleepTimer(value) {
+    if (sleepTimerInterval) {
+      clearInterval(sleepTimerInterval);
+      sleepTimerInterval = null;
+    }
+    const val = String(value || "off");
+    if (val === "off") {
+      state.sleepTimerMode = "off";
+      state.sleepTimerEndMs = 0;
+      showToast("🌙 Temporizador de apagado desactivado");
+    } else if (val === "chapter") {
+      state.sleepTimerMode = "chapter";
+      state.sleepTimerEndMs = 0;
+      showToast("🌙 La reproducción se detendrá al terminar este capítulo");
+    } else {
+      const mins = Math.max(1, Number(val) || 15);
+      state.sleepTimerMode = "minutes";
+      state.sleepTimerEndMs = Date.now() + mins * 60 * 1000;
+      sleepTimerInterval = setInterval(updateSleepTimerUi, 1000);
+      showToast(`🌙 Temporizador activado: apagado en ${mins} min`);
+    }
+    if (els.abSelectSleepTimer) els.abSelectSleepTimer.value = val;
+    updateSleepTimerUi();
+  }
+
+  function formatEstimatedTimeLeft(sentencesRemaining) {
+    const s = Math.max(0, Number(sentencesRemaining || 0));
+    const speed = Math.max(0.5, Number(state.speed || 1.0));
+    // Media aproximada de ~4.3s por frase a 1.0x
+    const totalSec = Math.round((s * 4.3) / speed);
+    if (totalSec < 60) return "< 1 min";
+    const totalMin = Math.round(totalSec / 60);
+    if (totalMin < 60) return `~${totalMin} min`;
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return m > 0 ? `~${h} h ${m} min` : `~${h} h`;
+  }
+
+  function syncAudiobookAndMiniPlayerUi() {
+    const book = state.currentBook;
+    const ch = state.currentChapter;
+    const totalSents = ch ? Number(ch.sentence_count || 0) : 0;
+    const curIdx = Number(state.sentenceIndex || 0);
+    const coverSrc = book && book.cover_url ? resolveApiUrl(book.cover_url) : "";
+
+    // 1. Mini-reproductor persistente (visible en Biblioteca cuando hay libro cargado)
+    if (book) {
+      if (els.miniPlayerTitle) els.miniPlayerTitle.textContent = book.title || "";
+      if (els.miniPlayerChapter) {
+        const chTitle = (ch && ch.title) || `Capítulo ${state.chapterIndex + 1}`;
+        const stats = computeBookProgressStats(book, state.chapterIndex, curIdx);
+        els.miniPlayerChapter.textContent = `${chTitle} • ${stats.percentStr}`;
+      }
+      if (els.miniPlayerCover && els.miniPlayerCoverFallback) {
+        if (coverSrc) {
+          if (els.miniPlayerCover.dataset.bookId !== book.id) {
+            els.miniPlayerCover.dataset.bookId = book.id;
+            els.miniPlayerCover.src = coverSrc;
+            els.miniPlayerCover.onload = () => {
+              els.miniPlayerCover.classList.remove("hidden");
+              els.miniPlayerCoverFallback.classList.add("hidden");
+            };
+            els.miniPlayerCover.onerror = () => {
+              els.miniPlayerCover.classList.add("hidden");
+              els.miniPlayerCoverFallback.classList.remove("hidden");
+            };
+          }
+        } else {
+          els.miniPlayerCover.classList.add("hidden");
+          els.miniPlayerCoverFallback.classList.remove("hidden");
+        }
+      }
+    }
+
+    // 2. Vista dedicada de Reproductor de Audiolibros
+    if (!book) return;
+    if (els.abBookTitle) els.abBookTitle.textContent = book.title || "";
+    if (els.abBookAuthor) els.abBookAuthor.textContent = book.author || "";
+    if (els.abChapterTitle) {
+      const rawChTitle = ch && ch.title ? String(ch.title).trim() : "";
+      els.abChapterTitle.textContent = rawChTitle
+        ? /^\d+$/.test(rawChTitle)
+          ? `Capítulo ${rawChTitle}`
+          : rawChTitle
+        : `Capítulo ${state.chapterIndex + 1} de ${book.chapter_count || 1}`;
+    }
+    if (els.abCoverWrap) {
+      els.abCoverWrap.classList.toggle("is-playing", Boolean(state.isPlaying && !state.isLoadingAudio));
+    }
+    if (els.abCoverImg && els.abCoverFallback) {
+      if (coverSrc) {
+        if (els.abCoverImg.dataset.bookId !== book.id) {
+          els.abCoverImg.dataset.bookId = book.id;
+          els.abCoverImg.src = coverSrc;
+          els.abCoverImg.onload = () => {
+            els.abCoverImg.classList.remove("hidden");
+            els.abCoverFallback.classList.add("hidden");
+          };
+          els.abCoverImg.onerror = () => {
+            els.abCoverImg.classList.add("hidden");
+            els.abCoverFallback.classList.remove("hidden");
+          };
+        }
+      } else {
+        els.abCoverImg.classList.add("hidden");
+        els.abCoverFallback.classList.remove("hidden");
+      }
+    }
+
+    if (els.abSubtitleBox) {
+      els.abSubtitleBox.classList.toggle("hidden", !state.abShowSubtitle);
+    }
+    if (els.abBtnToggleSubtitle) {
+      els.abBtnToggleSubtitle.classList.toggle("is-active", Boolean(state.abShowSubtitle));
+    }
+    if (els.abSubtitleText) {
+      const sentText = getSentenceText(curIdx);
+      els.abSubtitleText.textContent = sentText || "Pulsa Play para comenzar la narración.";
+    }
+
+    if (els.abChapterSlider) {
+      const maxVal = Math.max(0, totalSents - 1);
+      els.abChapterSlider.max = String(maxVal);
+      if (document.activeElement !== els.abChapterSlider) {
+        els.abChapterSlider.value = String(Math.min(curIdx, maxVal));
+      }
+    }
+
+    const stats = computeBookProgressStats(book, state.chapterIndex, curIdx);
+    const chRemSents = Math.max(0, totalSents - (curIdx + 1));
+    const bookRemSents = Math.max(0, Number(stats.totalSentences || 0) - Number(stats.sentencesRead || 0));
+    if (els.abChapterProgressMeta) {
+      els.abChapterProgressMeta.textContent = `Quedan ${formatEstimatedTimeLeft(chRemSents)} cap.`;
+    }
+    if (els.abBookProgressMeta) {
+      els.abBookProgressMeta.textContent = `${stats.percentStr} • ${formatEstimatedTimeLeft(bookRemSents)} libro`;
+    }
+
+    if (els.abIconPlay) els.abIconPlay.classList.toggle("hidden", state.isPlaying || state.isLoadingAudio);
+    if (els.abIconPause) els.abIconPause.classList.toggle("hidden", !state.isPlaying || state.isLoadingAudio);
+    if (els.abIconLoading) els.abIconLoading.classList.toggle("hidden", !state.isLoadingAudio);
+
+    if (els.abStatusDot) {
+      els.abStatusDot.classList.toggle("playing", state.isPlaying && !state.isLoadingAudio);
+      els.abStatusDot.classList.toggle("loading", state.isLoadingAudio);
+    }
+    if (els.abStatusText && els.statusText) {
+      els.abStatusText.textContent = els.statusText.textContent || "";
+    }
+
+    const speedNum = Number(state.speed || 1);
+    if (els.abSelectSpeed && els.selectSpeed) {
+      els.abSelectSpeed.value = els.selectSpeed.value;
+    }
+    if (els.abSpeedLabel) {
+      els.abSpeedLabel.textContent = `${speedNum.toFixed(2).replace(/\.00$/, ".0").replace(/(\.\d)0$/, "$1")}×`;
+    }
+    if (els.abSpeedPill) {
+      els.abSpeedPill.classList.toggle("is-active", Math.abs(speedNum - 1) > 0.01);
+    }
+    if (els.abSelectVoice && els.selectVoice) {
+      if (els.abSelectVoice.options.length !== els.selectVoice.options.length) {
+        els.abSelectVoice.innerHTML = els.selectVoice.innerHTML;
+      }
+      els.abSelectVoice.value = els.selectVoice.value;
+      if (els.abVoiceLabel) {
+        const selOpt = els.selectVoice.options[els.selectVoice.selectedIndex];
+        const rawName = selOpt ? selOpt.textContent || "" : "";
+        const cleanName = rawName
+          .replace(/\[[^\]]*\]/g, "")
+          .replace(/🎧/g, "")
+          .replace(/\((?:✓|↓)\)/g, "")
+          .replace(/\([^)]*\)/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+        els.abVoiceLabel.textContent = `🎙️ ${cleanName || "Voz"}`;
+      }
+    }
+    if (els.abBtnPrevChapter) {
+      els.abBtnPrevChapter.disabled = state.chapterIndex <= 0;
+    }
+    if (els.abBtnNextChapter) {
+      const hasPair = Boolean(book.pairing && book.pairing.paired_book_id && book.pairing.auto_switch_chapters);
+      els.abBtnNextChapter.disabled = !hasPair && state.chapterIndex >= (book.chapter_count || 1) - 1;
+    }
+    if (els.abBtnSwitchPaired) {
+      const freshBook = state.books.find((b) => b.id === book.id) || book;
+      const pairObj =
+        freshBook.pairing && freshBook.pairing.paired_book_id
+          ? freshBook.pairing
+          : book.pairing && book.pairing.paired_book_id
+          ? book.pairing
+          : null;
+      if (pairObj) {
+        const partnerIsEs = (pairObj.paired_book_lang || "").toLowerCase().startsWith("es");
+        els.abBtnSwitchPaired.textContent = partnerIsEs ? "🇪🇸 ES" : "🇬🇧 EN";
+        els.abBtnSwitchPaired.classList.remove("hidden");
+      } else {
+        els.abBtnSwitchPaired.classList.add("hidden");
+      }
+    }
+  }
+
+  function setReaderUiMode(mode) {
+    const nextMode = mode === "audiobook" ? "audiobook" : "reading";
+    state.readerUiMode = nextMode;
+    saveAppearancePrefs();
+    applyAppearance();
+    if (nextMode === "reading" && state.currentChapter) {
+      requestAnimationFrame(() => {
+        highlightCurrentSentence(true);
+      });
+    }
+  }
+
+  async function jumpBySentences(delta) {
+    if (!state.currentChapter || !state.currentBook) return;
+    const total = Number(state.currentChapter.sentence_count || 0);
+    const target = state.sentenceIndex + delta;
+    if (target >= 0 && target < total) {
+      jumpToSentence(target);
+      return;
+    }
+    const wasPlaying = state.isPlaying;
+    if (target < 0 && state.chapterIndex > 0) {
+      stopPlayback();
+      await loadChapter(state.chapterIndex - 1, -1, wasPlaying);
+    } else if (target >= total && state.chapterIndex < (state.currentBook.chapter_count || 1) - 1) {
+      stopPlayback();
+      await loadChapter(state.chapterIndex + 1, 0, wasPlaying);
+    } else {
+      jumpToSentence(Math.min(Math.max(0, target), Math.max(0, total - 1)));
+    }
+  }
+
+  function returnToActiveBookView(preferredMode = null) {
+    if (!state.currentBook) return;
+    if (preferredMode === "audiobook" || preferredMode === "reading") {
+      state.readerUiMode = preferredMode;
+      saveAppearancePrefs();
+    }
+    els.libraryView.classList.add("hidden");
+    els.readerView.classList.remove("hidden");
+    els.btnBackLibrary.classList.remove("hidden");
+    els.btnToggleToc.classList.remove("hidden");
+    if (els.btnTopbarAddBook) els.btnTopbarAddBook.classList.add("hidden");
+    if (els.btnOpenStudy) els.btnOpenStudy.classList.remove("hidden");
+    if (els.btnOpenExports) els.btnOpenExports.classList.remove("hidden");
+    if (els.btnOpenPairing) els.btnOpenPairing.classList.remove("hidden");
+    els.brandLogo.classList.add("hide-mobile");
+    els.currentBookTitle.textContent = state.currentBook.title || "";
+    els.currentBookTitle.title = state.currentBook.title || "";
+    applyAppearance();
+    if (state.readerUiMode !== "audiobook") {
+      requestAnimationFrame(() => highlightCurrentSentence(true));
+    }
+  }
+
+  async function closeMiniPlayerAndStop() {
+    stopPlayback();
+    clearSleepTimer();
+    if (state.currentBook && state.currentChapter) {
+      await saveReadingProgress({ immediate: true });
+    }
+    await flushActiveReadingSession();
+    state.currentBook = null;
+    state.currentChapter = null;
+    els.currentBookTitle.textContent = "";
+    els.currentBookTitle.title = "";
+    applyAppearance();
   }
 
   function renderModelsModal() {
@@ -2120,8 +2809,13 @@
       }
 
       state.books = srvBooks;
+      const activeIds = new Set(srvBooks.map((b) => b.id));
+      state.archivedBooks = (Array.isArray(data.archived_books) ? data.archived_books : [])
+        .filter((b) => b && !activeIds.has(b.id))
+        .map((b) => ({ ...b, is_archived: true }));
       try {
         localStorage.setItem("vozlectura_catalog_cache", JSON.stringify(srvBooks));
+        localStorage.setItem("vozlectura_archived_cache", JSON.stringify(state.archivedBooks));
       } catch (_) {}
       updateOfflineHeaderBadge();
       renderLibrary();
@@ -2139,6 +2833,15 @@
           if (!isTrulyOffline && offlineBooks.length === 0) {
             offlineBooks = cachedCatalog;
           }
+        }
+      } catch (_) {}
+      try {
+        const cachedArchived = JSON.parse(localStorage.getItem("vozlectura_archived_cache") || "[]");
+        if (Array.isArray(cachedArchived)) {
+          const activeOffIds = new Set(offlineBooks.map((b) => b.id));
+          state.archivedBooks = cachedArchived
+            .filter((b) => b && !activeOffIds.has(b.id))
+            .map((b) => ({ ...b, is_archived: true }));
         }
       } catch (_) {}
       state.books = offlineBooks;
@@ -2369,10 +3072,11 @@
   }
 
   function populateLibraryFilterDropdowns() {
+    const allCatalogBooks = [...state.books, ...(state.archivedBooks || [])];
     if (els.libFilterAuthor) {
       const prevAuthor = state.libFilterAuthor || "all";
       const authorCounts = new Map();
-      for (const b of state.books) {
+      for (const b of allCatalogBooks) {
         const a = String(b.author || "Autor desconocido").trim() || "Autor desconocido";
         authorCounts.set(a, (authorCounts.get(a) || 0) + 1);
       }
@@ -2398,7 +3102,7 @@
       const prevGenre = state.libFilterGenre || "all";
       const genreCounts = new Map();
       let unassignedCount = 0;
-      for (const b of state.books) {
+      for (const b of allCatalogBooks) {
         const gList =
           Array.isArray(b.genres) && b.genres.length > 0
             ? b.genres
@@ -2462,7 +3166,14 @@
     const fStatus = state.libFilterStatus || "all";
     const fRating = state.libFilterRating || "all";
 
-    const filtered = state.books.filter((book) => {
+    const sourceBooks =
+      fStatus === "archived"
+        ? state.archivedBooks || []
+        : hasActiveLibraryFilters()
+        ? [...state.books, ...(state.archivedBooks || [])]
+        : state.books;
+
+    const filtered = sourceBooks.filter((book) => {
       const titleStr = String(book.title || "").toLowerCase();
       const authorStr = String(book.author || "Autor desconocido").trim();
       const genreStr = getBookEffectiveGenre(book);
@@ -2491,7 +3202,7 @@
         }
       }
 
-      if (fStatus !== "all" && status !== fStatus) {
+      if (fStatus !== "all" && fStatus !== "archived" && status !== fStatus) {
         return false;
       }
 
@@ -2753,20 +3464,57 @@
         ? ` • ${pairedGroupsCount} ${pairedGroupsCount === 1 ? "pareja bilingüe" : "parejas bilingües"}`
         : "";
 
+    const archCount = (state.archivedBooks || []).length;
     if (hasFilters) {
-      els.libraryCount.textContent = `Mostrando ${shownCount} de ${totalCount} ${totalCount === 1 ? "libro" : "libros"}${pairNote}${state.isServerOffline ? " (En memoria local)" : ""}`;
+      els.libraryCount.textContent =
+        state.libFilterStatus === "archived"
+          ? `Archivo histórico: ${shownCount} ${shownCount === 1 ? "libro borrado" : "libros borrados"}`
+          : `Mostrando ${shownCount} de ${totalCount} ${totalCount === 1 ? "libro" : "libros"}${pairNote}${state.isServerOffline ? " (En memoria local)" : ""}`;
     } else {
       els.libraryCount.textContent = `${totalCount} ${totalCount === 1 ? "libro" : "libros"}${pairNote}${state.isServerOffline ? " (En memoria local)" : ""}`;
     }
 
+    if (els.libraryCount && els.libraryCount.parentElement) {
+      let archToggleBtn = document.getElementById("btn-toggle-archived-library");
+      if (archCount > 0 || state.libFilterStatus === "archived") {
+        if (!archToggleBtn) {
+          archToggleBtn = document.createElement("button");
+          archToggleBtn.id = "btn-toggle-archived-library";
+          archToggleBtn.type = "button";
+          archToggleBtn.className = "lib-archived-link";
+          archToggleBtn.addEventListener("click", () => {
+            state.libFilterStatus = state.libFilterStatus === "archived" ? "all" : "archived";
+            if (els.libFilterStatus) els.libFilterStatus.value = state.libFilterStatus;
+            renderLibrary();
+          });
+          els.libraryCount.insertAdjacentElement("afterend", archToggleBtn);
+        }
+        const isShowingArchived = state.libFilterStatus === "archived";
+        archToggleBtn.classList.toggle("is-active", isShowingArchived);
+        archToggleBtn.textContent = isShowingArchived
+          ? "✕ Volver a libros activos"
+          : `🗄️ ${archCount} en archivo histórico`;
+        archToggleBtn.title = isShowingArchived
+          ? "Volver a mostrar tus libros activos en el servidor"
+          : "Consultar libros borrados del servidor (historial, calificación y notas conservados)";
+        archToggleBtn.classList.remove("hidden");
+      } else if (archToggleBtn) {
+        archToggleBtn.classList.add("hidden");
+      }
+    }
+
     els.booksGrid.innerHTML = "";
 
-    if (shownCount === 0 && totalCount > 0) {
+    if (shownCount === 0 && (totalCount > 0 || archCount > 0)) {
       const emptyBox = document.createElement("div");
       emptyBox.className = "library-empty-filter-state";
       emptyBox.innerHTML = `
-        <p>🔍 Ningún libro coincide con los filtros seleccionados.</p>
-        <button type="button" class="secondary-btn" id="btn-empty-clear-filters">✖ Limpiar filtros y mostrar los ${totalCount} libros</button>
+        <p>${
+          state.libFilterStatus === "archived"
+            ? "🗄️ No hay ningún libro en el archivo histórico."
+            : "🔍 Ningún libro coincide con los filtros seleccionados."
+        }</p>
+        <button type="button" class="secondary-btn" id="btn-empty-clear-filters">✖ Limpiar filtros y mostrar los ${totalCount} libros activos</button>
       `;
       emptyBox.querySelector("#btn-empty-clear-filters").addEventListener("click", () => {
         resetLibraryFilters();
@@ -2778,8 +3526,13 @@
     for (const entry of visualEntries) {
       const book = entry.activeBook;
       const inactiveBook = entry.inactiveBook;
+      const isArchivedCard = Boolean(book.is_archived);
       const card = document.createElement("div");
-      card.className = entry.isPaired ? "book-card is-bilingual-card" : "book-card";
+      card.className = isArchivedCard
+        ? "book-card is-archived-card"
+        : entry.isPaired
+        ? "book-card is-bilingual-card"
+        : "book-card";
 
       const isEs = (book.language || "").startsWith("es");
       const langBadge = isEs ? "🇪🇸 ES" : `🇬🇧 ${String(book.language || "EN").toUpperCase()}`;
@@ -2928,6 +3681,7 @@
               <div class="book-meta-header-left">
                 <span class="lang-tag" title="Idioma del libro">${langBadge}</span>
                 <span class="catalog-pill ${statusMeta.cls} btn-card-edit-meta" title="Estado de lectura (pulsa para cambiar)">${statusMeta.label}</span>
+                ${isArchivedCard ? `<span class="catalog-pill archived-pill" title="Archivos EPUB y audios borrados del servidor para ahorrar espacio. Si vuelves a añadir el EPUB recuperará su ficha automáticamente.">🗄️ Archivado</span>` : ""}
               </div>
               <div class="card-stars-group" title="Valoración: ${effRating > 0 ? `${formatRatingValueEs(effRating)}/5 ★ (pulsa de nuevo en una estrella para media estrella)` : "Pulsa en las estrellas para puntuar (saltos de 0,5 ★)"}">${starsBtnsHtml}</div>
             </div>
@@ -2956,6 +3710,22 @@
           </div>
         </div>
         <div class="book-card-actions">
+          ${
+            isArchivedCard
+              ? `
+          <div class="book-card-actions-main">
+            <button class="primary-btn btn-open-archived-study" data-id="${book.id}">
+              📓 Ver Ficha, Notas y Sesiones
+            </button>
+          </div>
+          <div class="book-card-actions-tools">
+            <button class="secondary-btn btn-study-book" data-id="${book.id}" title="Cuaderno de lectura, género, estado, nota y Obsidian">📓 Notas</button>
+            <button class="secondary-btn btn-reupload-archived" data-id="${book.id}" title="Volver a añadir el EPUB para leer o escuchar recuperando todo este historial">📤 Re-subir EPUB</button>
+            <button class="delete-book-btn btn-purge-archived" data-id="${book.id}" title="Eliminar definitivamente historial y calificación">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
+            </button>
+          </div>`
+              : `
           <div class="book-card-actions-main">
             <button class="primary-btn btn-open-book" data-id="${book.id}">
               ${
@@ -2972,10 +3742,11 @@
             <button class="secondary-btn btn-study-book" data-id="${book.id}" title="Cuaderno de lectura, género, estado, nota y Obsidian">📓 Notas</button>
             <button class="secondary-btn btn-pair-book" data-id="${book.id}" title="Emparejar versión en Inglés y Castellano">🇬🇧↔🇪🇸</button>
             <button class="secondary-btn btn-export-book" data-id="${book.id}" title="Generar M4B, EPUB Media Overlay y caché permanente">🎧 M4B</button>
-            <button class="delete-book-btn" data-id="${book.id}" title="Eliminar libro">
+            <button class="delete-book-btn" data-id="${book.id}" title="Eliminar archivos del servidor (conservando historial y notas)">
               <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
             </button>
-          </div>
+          </div>`
+          }
         </div>
       `;
 
@@ -3004,29 +3775,64 @@
         });
       });
 
-      card.querySelector(".btn-open-book").addEventListener("click", () =>
-        openBook(book.id, { preferLocal: state.offlineBooksMap.has(book.id) })
-      );
-      card.querySelector(".btn-offline-book").addEventListener("click", (e) => {
-        e.stopPropagation();
-        openOfflineModal(book);
-      });
-      card.querySelector(".btn-study-book").addEventListener("click", (e) => {
-        e.stopPropagation();
-        openStudyModal(book);
-      });
-      card.querySelector(".btn-pair-book").addEventListener("click", (e) => {
-        e.stopPropagation();
-        openPairingModal(book);
-      });
-      card.querySelector(".btn-export-book").addEventListener("click", (e) => {
-        e.stopPropagation();
-        openExportsModal(book);
-      });
-      card.querySelector(".delete-book-btn").addEventListener("click", (e) => {
-        e.stopPropagation();
-        deleteBook(book.id, book.title);
-      });
+      const openBookBtn = card.querySelector(".btn-open-book");
+      if (openBookBtn) {
+        openBookBtn.addEventListener("click", () =>
+          openBook(book.id, { preferLocal: state.offlineBooksMap.has(book.id) })
+        );
+      }
+      const openArchStudyBtn = card.querySelector(".btn-open-archived-study");
+      if (openArchStudyBtn) {
+        openArchStudyBtn.addEventListener("click", () => openStudyModal(book, "habits"));
+      }
+      const reuploadBtn = card.querySelector(".btn-reupload-archived");
+      if (reuploadBtn && els.fileInput) {
+        reuploadBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          els.fileInput.click();
+        });
+      }
+      const offlineBookBtn = card.querySelector(".btn-offline-book");
+      if (offlineBookBtn) {
+        offlineBookBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openOfflineModal(book);
+        });
+      }
+      const studyBookBtn = card.querySelector(".btn-study-book");
+      if (studyBookBtn) {
+        studyBookBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openStudyModal(book);
+        });
+      }
+      const pairBookBtn = card.querySelector(".btn-pair-book");
+      if (pairBookBtn) {
+        pairBookBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openPairingModal(book);
+        });
+      }
+      const exportBookBtn = card.querySelector(".btn-export-book");
+      if (exportBookBtn) {
+        exportBookBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          openExportsModal(book);
+        });
+      }
+      const purgeBtn = card.querySelector(".btn-purge-archived");
+      const deleteBtn = card.querySelector(".delete-book-btn");
+      if (purgeBtn) {
+        purgeBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          purgeArchivedBookHistory(book.id, book.title);
+        });
+      } else if (deleteBtn) {
+        deleteBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          deleteBook(book.id, book.title);
+        });
+      }
 
       els.booksGrid.appendChild(card);
     }
@@ -3320,7 +4126,12 @@
         }
       );
 
-      if (data.book && data.book.has_embedded_media_overlay) {
+      if (data.restored_from_archive) {
+        showToast(
+          `♻️ «${data.book.title}» restaurado con todo su historial de lectura, calificación y notas`,
+          6000
+        );
+      } else if (data.book && data.book.has_embedded_media_overlay) {
         await fetchVoices();
         showToast(
           `🎧 EPUB Media Overlay detectado: "${data.book.title}" (${data.book.embedded_media_overlay_sentences || data.book.total_sentences} frases con audio sincronizado listas sin recalcular)`,
@@ -3340,13 +4151,43 @@
   }
 
   async function deleteBook(bookId, title) {
-    if (!confirm(`¿Eliminar "${title}" de la biblioteca?`)) return;
+    if (
+      !confirm(
+        `¿Borrar los archivos pesados de «${title}» del servidor para liberar espacio?\n\n✅ Se conservarán intactos tu registro de lectura, fechas, calificación, vocabulario y notas de Obsidian (y se restaurarán solos si vuelves a subir el EPUB).`
+      )
+    ) {
+      return;
+    }
     try {
-      await fetch(`/api/books/${bookId}`, { method: "DELETE" });
-      showToast("Libro eliminado");
+      if (state.currentBook && state.currentBook.id === bookId) {
+        await closeMiniPlayerAndStop();
+      }
+      await fetch(`/api/books/${encodeURIComponent(bookId)}`, { method: "DELETE" });
+      showToast(`🗄️ Archivos de «${title}» liberados — Tu historial y notas siguen guardados`, 4800);
       await fetchLibrary();
+      fetchReadingAnalytics().catch(() => {});
     } catch (err) {
       showToast("No se pudo eliminar el libro");
+    }
+  }
+
+  async function purgeArchivedBookHistory(bookId, title) {
+    if (
+      !confirm(
+        `¿Eliminar DEFINITIVAMENTE el historial, sesiones y calificación de «${title}»?\n\nEsta acción borrará también su registro de Hábitos y Valoraciones.`
+      )
+    ) {
+      return;
+    }
+    try {
+      await fetch(`/api/books/${encodeURIComponent(bookId)}?purge_history=true`, {
+        method: "DELETE",
+      });
+      showToast(`Historial de «${title}» eliminado permanentemente`);
+      await fetchLibrary();
+      fetchReadingAnalytics().catch(() => {});
+    } catch (err) {
+      showToast("No se pudo eliminar el historial del libro");
     }
   }
 
@@ -3407,9 +4248,32 @@
   // Abrir un libro y cargar el capítulo guardado (Prioridad Local-First si está en memoria del dispositivo)
   async function openBook(
     bookId,
-    { overrideChapterIndex = null, overrideSentenceIndex = null, autoPlay = false, preferLocal = false } = {}
+    {
+      overrideChapterIndex = null,
+      overrideSentenceIndex = null,
+      autoPlay = false,
+      preferLocal = false,
+      keepViewHidden = false,
+      preferredUiMode = null,
+    } = {}
   ) {
-    if (state.autoFullscreen) {
+    // Si ya tenemos abierto este mismo libro en segundo plano (p. ej. sonando desde la Biblioteca), volver sin cortar el audio
+    if (
+      state.currentBook &&
+      state.currentBook.id === bookId &&
+      state.currentChapter &&
+      overrideChapterIndex === null &&
+      overrideSentenceIndex === null &&
+      !keepViewHidden
+    ) {
+      returnToActiveBookView(preferredUiMode);
+      if (autoPlay && !state.isPlaying) {
+        startPlayback();
+      }
+      return;
+    }
+
+    if (state.autoFullscreen && !keepViewHidden) {
       enterFullscreenIfAllowed();
     }
     stopPlayback();
@@ -3555,18 +4419,30 @@
         els.selectVoice.insertBefore(customOpt, els.selectVoice.firstChild);
       }
       els.selectVoice.value = state.selectedVoice;
+      if (els.abSelectVoice) {
+        els.abSelectVoice.innerHTML = els.selectVoice.innerHTML;
+        els.abSelectVoice.value = state.selectedVoice;
+      }
 
-      els.currentBookTitle.textContent = state.currentBook.title;
+      if (preferredUiMode === "audiobook" || preferredUiMode === "reading") {
+        state.readerUiMode = preferredUiMode;
+        saveAppearancePrefs();
+      }
+
       els.chapterContent.lang = (state.currentBook.language || "es").slice(0, 2).toLowerCase();
-      els.libraryView.classList.add("hidden");
-      els.readerView.classList.remove("hidden");
-      els.btnBackLibrary.classList.remove("hidden");
-      els.btnToggleToc.classList.remove("hidden");
-      if (els.btnTopbarAddBook) els.btnTopbarAddBook.classList.add("hidden");
-      if (els.btnOpenStudy) els.btnOpenStudy.classList.remove("hidden");
-      if (els.btnOpenExports) els.btnOpenExports.classList.remove("hidden");
-      if (els.btnOpenPairing) els.btnOpenPairing.classList.remove("hidden");
-      els.brandLogo.classList.add("hide-mobile");
+      if (!keepViewHidden) {
+        els.currentBookTitle.textContent = state.currentBook.title;
+        els.currentBookTitle.title = state.currentBook.title || "";
+        els.libraryView.classList.add("hidden");
+        els.readerView.classList.remove("hidden");
+        els.btnBackLibrary.classList.remove("hidden");
+        els.btnToggleToc.classList.remove("hidden");
+        if (els.btnTopbarAddBook) els.btnTopbarAddBook.classList.add("hidden");
+        if (els.btnOpenStudy) els.btnOpenStudy.classList.remove("hidden");
+        if (els.btnOpenExports) els.btnOpenExports.classList.remove("hidden");
+        if (els.btnOpenPairing) els.btnOpenPairing.classList.remove("hidden");
+        els.brandLogo.classList.add("hide-mobile");
+      }
 
       updateStudyHeaderBadge();
       updatePairingHeaderButtons();
@@ -3602,6 +4478,7 @@
         els.btnSwitchPaired.classList.add("hidden");
       }
     }
+    syncAudiobookAndMiniPlayerUi();
   }
 
   function resolvePairedTargetChapter(
@@ -3737,6 +4614,7 @@
           overrideSentenceIndex: 0,
           autoPlay: wasPlaying,
           preferLocal: state.offlineBooksMap.has(pairing.paired_book_id),
+          keepViewHidden: Boolean(els.readerView && els.readerView.classList.contains("hidden")),
         });
         return true;
       }
@@ -3834,7 +4712,19 @@
           : Math.min(Math.max(0, initialSentenceIdx), maxSentence);
 
       els.chapterBadge.textContent = state.currentChapter.title;
-      els.chapterContent.innerHTML = state.currentChapter.html;
+      let chapterHtml = state.currentChapter.html || "";
+      if (
+        chapterIdx === 0 &&
+        state.currentBook.cover_url &&
+        !chapterHtml.includes("/cover")
+      ) {
+        const coverSrc = resolveApiUrl(state.currentBook.cover_url);
+        const safeBookTitle = escapeHtml(state.currentBook.title || "Portada");
+        chapterHtml =
+          `<div class="epub-cover-page"><img src="${coverSrc}" class="epub-illustration epub-cover-img" alt="Portada de ${safeBookTitle}" title="Pulsa para ampliar la portada" /></div>` +
+          chapterHtml;
+      }
+      els.chapterContent.innerHTML = chapterHtml;
 
       const hasBilingualNext = Boolean(
         state.currentBook.pairing &&
@@ -3863,11 +4753,36 @@
 
       applyStudyDecorationsToChapter();
 
-      // Si el capítulo contiene ilustraciones, recalcular paginación cuando carguen
+      // Si el capítulo contiene ilustraciones, recalcular paginación cuando carguen y permitir ampliarlas al pulsar
       els.chapterContent.querySelectorAll("img").forEach((img) => {
+        if (!img.classList.contains("epub-illustration")) {
+          img.classList.add("epub-illustration");
+        }
+        const rawAttrSrc = img.getAttribute("src") || "";
+        if (rawAttrSrc.startsWith("/api/")) {
+          img.src = resolveApiUrl(rawAttrSrc);
+        }
+        if (!img.title) {
+          img.title = "Pulsa para ampliar y analizar la imagen";
+        }
+        img.addEventListener("click", (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          openImageLightbox(img);
+        });
         img.addEventListener("load", () => {
           if (state.flowMode === "paginated") {
             updatePaginationLayout(true);
+            if (
+              chapterIdx === 0 &&
+              initialSentenceIdx === 0 &&
+              !autoPlay &&
+              !state.isPlaying &&
+              state.currentBook &&
+              state.currentBook.cover_url
+            ) {
+              goToPage(0, { animate: false, syncSentenceIfPaused: false });
+            }
           }
         });
       });
@@ -3875,6 +4790,17 @@
       renderToc();
       updatePaginationLayout(true);
       highlightCurrentSentence(true);
+      if (
+        chapterIdx === 0 &&
+        initialSentenceIdx === 0 &&
+        !autoPlay &&
+        !state.isPlaying &&
+        state.currentBook &&
+        state.currentBook.cover_url &&
+        state.flowMode === "paginated"
+      ) {
+        goToPage(0, { animate: false, syncSentenceIfPaused: false });
+      }
       saveReadingProgress();
 
       if (autoPlay) {
@@ -4086,22 +5012,32 @@
     });
 
     const activeSpan = document.getElementById(`sent-${idx}`);
+    const isReadingVisible =
+      els.readerView &&
+      !els.readerView.classList.contains("hidden") &&
+      state.readerUiMode !== "audiobook";
     if (activeSpan) {
       els.activeSentencePreview.textContent = activeSpan.textContent;
-      if (state.flowMode === "paginated") {
-        if (state.autoScroll || forceScroll) {
-          const targetPage = getPageForSentence(idx);
-          if (targetPage !== state.currentPage || forceScroll) {
-            goToPage(targetPage, { animate: !forceScroll, syncSentenceIfPaused: false });
+      if (isReadingVisible) {
+        if (state.flowMode === "paginated") {
+          if (state.autoScroll || forceScroll) {
+            const targetPage = getPageForSentence(idx);
+            if (targetPage !== state.currentPage || forceScroll) {
+              goToPage(targetPage, { animate: !forceScroll, syncSentenceIfPaused: false });
+            }
           }
+        } else if (state.autoScroll || forceScroll) {
+          activeSpan.scrollIntoView({
+            behavior: "smooth",
+            block: "center",
+          });
         }
-      } else if (state.autoScroll || forceScroll) {
-        activeSpan.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
       }
+    } else {
+      const txt = getSentenceText(idx);
+      if (txt) els.activeSentencePreview.textContent = txt;
     }
+    syncAudiobookAndMiniPlayerUi();
   }
 
   function getSentenceText(index) {
@@ -4284,6 +5220,7 @@
     }
 
     updateMediaSessionMetadata();
+    syncAudiobookAndMiniPlayerUi();
   }
 
   async function startPlayback() {
@@ -4410,6 +5347,13 @@
       if (state.sentenceIndex < state.currentChapter.sentence_count - 1) {
         state.sentenceIndex++;
       } else {
+        if (state.sleepTimerMode === "chapter") {
+          clearSleepTimer();
+          await saveReadingProgress({ immediate: true });
+          showToast("🌙 Fin de capítulo alcanzado — Reproducción detenida", 5000);
+          stopPlayback();
+          return;
+        }
         const switchedBookOrChapter = await advanceAfterChapterEnd(true);
         if (!switchedBookOrChapter) {
           if (state.currentBook) {
@@ -5613,6 +6557,9 @@
       );
       await fetchLibrary();
       updatePairingHeaderButtons();
+      if (state.currentBook && !state.isServerOffline) {
+        fetchBookStudy(state.currentBook.id).catch(() => {});
+      }
     } catch (err) {
       showToast(`Error: ${err.message}`);
     }
@@ -5645,6 +6592,9 @@
       showToast("Libros desvinculados");
       await fetchLibrary();
       updatePairingHeaderButtons();
+      if (state.currentBook && !state.isServerOffline) {
+        fetchBookStudy(state.currentBook.id).catch(() => {});
+      }
     } catch (err) {
       showToast(`Error: ${err.message}`);
     }
@@ -5695,6 +6645,7 @@
       overrideSentenceIndex: targetSentence,
       autoPlay: wasPlaying,
       preferLocal: state.offlineBooksMap.has(partnerId),
+      keepViewHidden: Boolean(els.readerView && els.readerView.classList.contains("hidden")),
     });
 
     if (state.currentBook && state.currentBook.id === partnerId) {
@@ -7468,6 +8419,8 @@
     }
   }
 
+  let currentActiveStudyTab = "habits";
+
   // Modal Cuaderno de Lectura y Exportación a Obsidian (.md)
   async function openStudyModal(bookObj = null, initialTab = "habits") {
     const target = bookObj || state.currentBook;
@@ -7528,6 +8481,7 @@
   }
 
   function switchStudyTab(tabName) {
+    currentActiveStudyTab = tabName || "habits";
     document.querySelectorAll(".study-tab").forEach((btn) => {
       btn.classList.toggle("active", btn.dataset.studyTab === tabName);
     });
@@ -7562,6 +8516,8 @@
 
     els.studyCountHighlights.textContent = String(hls.length);
     els.studyCountVocab.textContent = String(voc.length);
+
+    renderStudyPairedBanner(study);
 
     els.studyStatus.value = study.reading_status || "reading";
     els.studyStartedAt.value =
@@ -7695,6 +8651,12 @@
           }
         `;
         card.querySelector(".btn-jump-hl").addEventListener("click", async () => {
+          if (state.studyTargetBook && state.studyTargetBook.is_archived) {
+            showToast(
+              "🗄️ El archivo EPUB se borró para ahorrar espacio. Vuelve a añadir el EPUB si deseas saltar al texto."
+            );
+            return;
+          }
           els.studyModal.classList.add("hidden");
           if (!state.currentBook || state.currentBook.id !== state.studyTargetBook.id) {
             await openBook(state.studyTargetBook.id, {
@@ -7763,6 +8725,12 @@
           }
         `;
         card.querySelector(".btn-jump-vocab").addEventListener("click", async () => {
+          if (state.studyTargetBook && state.studyTargetBook.is_archived) {
+            showToast(
+              "🗄️ El archivo EPUB se borró para ahorrar espacio. Vuelve a añadir el EPUB si deseas saltar al texto."
+            );
+            return;
+          }
           els.studyModal.classList.add("hidden");
           if (!state.currentBook || state.currentBook.id !== state.studyTargetBook.id) {
             await openBook(state.studyTargetBook.id, {
@@ -7986,6 +8954,38 @@
         btnOpenInObsidian.href = "obsidian://open";
       }
     }
+  }
+
+  function renderStudyPairedBanner(study) {
+    const banner = document.getElementById("study-paired-banner");
+    const infoSpan = document.getElementById("study-paired-partner-info");
+    const openBtn = document.getElementById("btn-study-open-partner");
+    if (!banner || !infoSpan || !openBtn) return;
+
+    const targetBook = state.studyTargetBook || state.currentBook;
+    const pairInfo =
+      (study && study.pairing_info && study.pairing_info.paired_book_id
+        ? study.pairing_info
+        : null) ||
+      (targetBook && targetBook.pairing && targetBook.pairing.paired_book_id
+        ? targetBook.pairing
+        : null);
+
+    if (!pairInfo || !pairInfo.paired_book_id) {
+      banner.classList.add("hidden");
+      openBtn.dataset.partnerId = "";
+      return;
+    }
+
+    const pLang = String(pairInfo.paired_book_lang || "").toLowerCase();
+    const pFlag = pLang.startsWith("es") ? "🇪🇸" : "🇬🇧";
+    const pTitle = pairInfo.paired_book_title || pairInfo.paired_book_id;
+    const pNote = pairInfo.partner_obsidian_note || pTitle;
+    infoSpan.innerHTML = `${pFlag} <strong>${escapeHtml(pTitle)}</strong> (<code>[[${escapeHtml(pNote)}]]</code>)`;
+    openBtn.dataset.partnerId = pairInfo.paired_book_id;
+    openBtn.dataset.partnerTitle = pTitle;
+    openBtn.dataset.partnerLang = pairInfo.paired_book_lang || "";
+    banner.classList.remove("hidden");
   }
 
   async function syncBookObsidianNow() {
@@ -8620,7 +9620,11 @@
     const sortBy = (document.getElementById("rank-sort-by") || {}).value || "rating_desc";
 
     const filtered = books.filter((b) => {
-      if (statusFilter !== "all" && b.reading_status !== statusFilter) return false;
+      if (statusFilter === "archived") {
+        if (!b.is_archived) return false;
+      } else if (statusFilter !== "all" && b.reading_status !== statusFilter) {
+        return false;
+      }
       const rVal = normalizeHalfStarRating(b.rating);
       if (ratingFilter === "5" && rVal < 5) return false;
       if (ratingFilter === "4.5plus" && rVal < 4.5) return false;
@@ -8689,6 +9693,7 @@
             <span class="badge-pill" style="font-weight:800">#${idx + 1}</span>
             <div>
               <strong style="font-size:1rem">${escapeHtml(b.title)}</strong>
+              ${b.is_archived ? `<span class="badge-pill" style="margin-left:6px;font-size:0.72rem" title="Archivos pesados eliminados del servidor; historial conservado">🗄️ Archivado</span>` : ""}
               <span style="color:var(--text-secondary);font-size:0.84rem;margin-left:6px">por ${escapeHtml(b.author)}</span>
             </div>
           </div>
@@ -8756,7 +9761,14 @@
       const notesBtn = card.querySelector(".btn-rank-open-notes");
       if (notesBtn) {
         notesBtn.addEventListener("click", () => {
-          const found = state.books.find((x) => x.id === b.book_id) || { id: b.book_id, title: b.title };
+          const found =
+            state.books.find((x) => x.id === b.book_id) ||
+            (state.archivedBooks || []).find((x) => x.id === b.book_id) || {
+              id: b.book_id,
+              title: b.title,
+              author: b.author,
+              is_archived: Boolean(b.is_archived),
+            };
           document.getElementById("analytics-modal").classList.add("hidden");
           openStudyModal(found, "habits");
         });
@@ -9272,6 +10284,27 @@
     }
     await OfflineStore.saveBookBundle(bundleData);
     await refreshOfflineMap();
+
+    // Pre-cachear portada e ilustraciones del EPUB para que se vean también sin conexión
+    if (Array.isArray(bundleData.assets) && bundleData.assets.length > 0 && "caches" in window) {
+      caches
+        .open("vozlectura-book-assets-v1")
+        .then(async (cache) => {
+          for (const assetUrl of bundleData.assets) {
+            try {
+              const fullUrl = resolveApiUrl(assetUrl);
+              const existing = await cache.match(fullUrl, { ignoreSearch: true });
+              if (!existing) {
+                const resp = await fetch(fullUrl);
+                if (resp && resp.ok) {
+                  await cache.put(fullUrl, resp);
+                }
+              }
+            } catch (_) {}
+          }
+        })
+        .catch(() => {});
+    }
 
     if (mode === "text_only") {
       els.offlineDlPct.textContent = "100%";
@@ -9902,6 +10935,47 @@
     }
   }
 
+  let lightboxZoom = 1;
+
+  function applyLightboxZoom() {
+    const imgEl = document.getElementById("lightbox-img");
+    const resetBtn = document.getElementById("btn-lightbox-zoom-reset");
+    if (!imgEl) return;
+    if (lightboxZoom <= 1.01) {
+      imgEl.style.transform = "";
+      imgEl.style.maxWidth = "96%";
+      imgEl.style.maxHeight = "92%";
+      if (resetBtn) resetBtn.textContent = "100%";
+    } else {
+      imgEl.style.maxWidth = "none";
+      imgEl.style.maxHeight = "none";
+      imgEl.style.transform = `scale(${lightboxZoom.toFixed(2)})`;
+      if (resetBtn) resetBtn.textContent = `${Math.round(lightboxZoom * 100)}%`;
+    }
+  }
+
+  function openImageLightbox(sourceImgEl) {
+    const modal = document.getElementById("image-lightbox-modal");
+    const imgEl = document.getElementById("lightbox-img");
+    const capEl = document.getElementById("lightbox-caption");
+    if (!modal || !imgEl || !sourceImgEl) return;
+    lightboxZoom = 1;
+    imgEl.src = sourceImgEl.currentSrc || sourceImgEl.src || "";
+    imgEl.alt = sourceImgEl.alt || "Ilustración del libro";
+    if (capEl) {
+      capEl.textContent =
+        (sourceImgEl.alt && sourceImgEl.alt.trim()) ||
+        (state.currentBook ? `${state.currentBook.title} — Ilustración` : "Ilustración");
+    }
+    applyLightboxZoom();
+    modal.classList.remove("hidden");
+  }
+
+  function closeImageLightbox() {
+    const modal = document.getElementById("image-lightbox-modal");
+    if (modal) modal.classList.add("hidden");
+  }
+
   function escapeHtml(str) {
     return String(str || "")
       .replace(/&/g, "&amp;")
@@ -9912,6 +10986,51 @@
 
   // Eventos de interfaz
   function bindEvents() {
+    const lbModal = document.getElementById("image-lightbox-modal");
+    const lbStage = document.getElementById("image-lightbox-stage");
+    const lbImg = document.getElementById("lightbox-img");
+    const btnLbClose = document.getElementById("btn-lightbox-close");
+    const btnLbIn = document.getElementById("btn-lightbox-zoom-in");
+    const btnLbOut = document.getElementById("btn-lightbox-zoom-out");
+    const btnLbReset = document.getElementById("btn-lightbox-zoom-reset");
+    if (btnLbClose) btnLbClose.addEventListener("click", closeImageLightbox);
+    if (btnLbIn) {
+      btnLbIn.addEventListener("click", () => {
+        lightboxZoom = Math.min(3.5, lightboxZoom + 0.35);
+        applyLightboxZoom();
+      });
+    }
+    if (btnLbOut) {
+      btnLbOut.addEventListener("click", () => {
+        lightboxZoom = Math.max(1, lightboxZoom - 0.35);
+        applyLightboxZoom();
+      });
+    }
+    if (btnLbReset) {
+      btnLbReset.addEventListener("click", () => {
+        lightboxZoom = 1;
+        applyLightboxZoom();
+      });
+    }
+    if (lbImg) {
+      lbImg.addEventListener("dblclick", () => {
+        lightboxZoom = lightboxZoom > 1.05 ? 1 : 2;
+        applyLightboxZoom();
+      });
+    }
+    if (lbStage) {
+      lbStage.addEventListener("click", (e) => {
+        if (e.target === lbStage) closeImageLightbox();
+      });
+    }
+    if (lbModal) {
+      document.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && !lbModal.classList.contains("hidden")) {
+          closeImageLightbox();
+        }
+      });
+    }
+
     els.btnSelectEpub.addEventListener("click", (e) => {
       e.stopPropagation();
       els.fileInput.click();
@@ -10005,11 +11124,11 @@
     }
 
     els.btnBackLibrary.addEventListener("click", async () => {
-      stopPlayback();
+      const wasPlaying = state.isPlaying;
       hideDictionaryPopover();
       hideSelectionToolbar();
       await saveReadingProgress({ immediate: true });
-      await flushActiveReadingSession();
+      await flushActiveReadingSession({ keepActive: wasPlaying });
       els.readerView.classList.add("hidden");
       els.libraryView.classList.remove("hidden");
       els.btnBackLibrary.classList.add("hidden");
@@ -10020,9 +11139,162 @@
       els.tocSidebar.classList.add("hidden");
       els.brandLogo.classList.remove("hide-mobile");
       els.currentBookTitle.textContent = "";
+      els.currentBookTitle.title = "";
       applyAppearance();
+      if (wasPlaying && state.currentBook) {
+        showToast(`🎧 «${state.currentBook.title}» sigue reproduciéndose en el mini-reproductor`, 3200);
+      }
       await Promise.all([fetchLibrary(), refreshExportsStatus()]);
     });
+
+    // Conmutadores de Modo Audiolibro, Mini-reproductor y Temporizador de Apagado
+    if (els.btnToggleAudiobookMode) {
+      els.btnToggleAudiobookMode.addEventListener("click", () => {
+        setReaderUiMode(state.readerUiMode === "audiobook" ? "reading" : "audiobook");
+      });
+    }
+    if (els.btnPlayerAudiobookToggle) {
+      els.btnPlayerAudiobookToggle.addEventListener("click", () => {
+        if (!state.currentBook) return;
+        if (els.readerView.classList.contains("hidden")) {
+          returnToActiveBookView("audiobook");
+        } else {
+          setReaderUiMode(state.readerUiMode === "audiobook" ? "reading" : "audiobook");
+        }
+      });
+    }
+    if (els.playerSleepBadge) {
+      els.playerSleepBadge.addEventListener("click", () => {
+        if (!state.currentBook) return;
+        returnToActiveBookView("audiobook");
+      });
+    }
+    if (els.miniPlayerOpenBook) {
+      els.miniPlayerOpenBook.addEventListener("click", () => returnToActiveBookView(null));
+    }
+    if (els.btnMiniOpenReading) {
+      els.btnMiniOpenReading.addEventListener("click", () => returnToActiveBookView("reading"));
+    }
+    if (els.btnMiniOpenAudiobook) {
+      els.btnMiniOpenAudiobook.addEventListener("click", () => returnToActiveBookView("audiobook"));
+    }
+    if (els.btnMiniClosePlayer) {
+      els.btnMiniClosePlayer.addEventListener("click", () => {
+        closeMiniPlayerAndStop();
+      });
+    }
+    if (els.abBtnBackLibrary && els.btnBackLibrary) {
+      els.abBtnBackLibrary.addEventListener("click", () => els.btnBackLibrary.click());
+    }
+    if (els.abBtnBackReading) {
+      els.abBtnBackReading.addEventListener("click", () => setReaderUiMode("reading"));
+    }
+    if (els.abBtnOpenToc) {
+      els.abBtnOpenToc.addEventListener("click", () => {
+        els.tocSidebar.classList.toggle("hidden");
+      });
+    }
+    if (els.abChapterBtn) {
+      els.abChapterBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        els.tocSidebar.classList.toggle("hidden");
+      });
+    }
+    if (els.audiobookPlayerView) {
+      els.audiobookPlayerView.addEventListener("click", (e) => {
+        if (
+          els.tocSidebar &&
+          !els.tocSidebar.classList.contains("hidden") &&
+          (!els.abChapterBtn || !els.abChapterBtn.contains(e.target))
+        ) {
+          els.tocSidebar.classList.add("hidden");
+        }
+      });
+    }
+    if (els.abBtnSwitchPaired) {
+      els.abBtnSwitchPaired.addEventListener("click", switchToPairedBookNow);
+    }
+    if (els.abBtnPlayPause) {
+      els.abBtnPlayPause.addEventListener("click", () => {
+        if (state.isPlaying) stopPlayback();
+        else startPlayback();
+      });
+    }
+    if (els.abBtnPrevSent) {
+      els.abBtnPrevSent.addEventListener("click", () => jumpBySentences(-1));
+    }
+    if (els.abBtnNextSent) {
+      els.abBtnNextSent.addEventListener("click", () => jumpBySentences(1));
+    }
+    if (els.abBtnBackFast) {
+      els.abBtnBackFast.addEventListener("click", () => jumpBySentences(-3));
+    }
+    if (els.abBtnFwdFast) {
+      els.abBtnFwdFast.addEventListener("click", () => jumpBySentences(3));
+    }
+    if (els.abBtnPrevChapter) {
+      els.abBtnPrevChapter.addEventListener("click", async () => {
+        if (!state.currentBook || state.chapterIndex <= 0) return;
+        const wasPlaying = state.isPlaying;
+        stopPlayback();
+        await loadChapter(state.chapterIndex - 1, 0, wasPlaying);
+      });
+    }
+    if (els.abBtnNextChapter) {
+      els.abBtnNextChapter.addEventListener("click", async () => {
+        if (!state.currentBook) return;
+        const wasPlaying = state.isPlaying;
+        stopPlayback();
+        await advanceAfterChapterEnd(wasPlaying);
+      });
+    }
+    if (els.abBtnToggleSubtitle) {
+      els.abBtnToggleSubtitle.addEventListener("click", () => {
+        state.abShowSubtitle = !state.abShowSubtitle;
+        saveAppearancePrefs();
+        syncAudiobookAndMiniPlayerUi();
+      });
+    }
+    if (els.abChapterSlider) {
+      els.abChapterSlider.addEventListener("input", () => {
+        const val = Number(els.abChapterSlider.value || 0);
+        if (els.abSubtitleText) {
+          const preview = getSentenceText(val);
+          if (preview) els.abSubtitleText.textContent = preview;
+        }
+      });
+      els.abChapterSlider.addEventListener("change", () => {
+        const val = Number(els.abChapterSlider.value || 0);
+        jumpToSentence(val);
+      });
+    }
+    if (els.abSelectSpeed && els.selectSpeed) {
+      els.abSelectSpeed.addEventListener("change", () => {
+        els.selectSpeed.value = els.abSelectSpeed.value;
+        els.selectSpeed.dispatchEvent(new Event("change"));
+      });
+    }
+    if (els.abSelectVoice && els.selectVoice) {
+      els.abSelectVoice.addEventListener("change", () => {
+        els.selectVoice.value = els.abSelectVoice.value;
+        els.selectVoice.dispatchEvent(new Event("change"));
+      });
+    }
+    if (els.abBtnCarMode && els.btnQuickCarMode) {
+      els.abBtnCarMode.addEventListener("click", () => {
+        els.btnQuickCarMode.click();
+      });
+    }
+    if (els.abSelectSleepTimer) {
+      els.abSelectSleepTimer.addEventListener("change", () => {
+        setSleepTimer(els.abSelectSleepTimer.value);
+      });
+    }
+    if (els.btnCheckTtsUpdates) {
+      els.btnCheckTtsUpdates.addEventListener("click", () => {
+        checkTtsEngineUpdates({ force: true, notifyToast: false });
+      });
+    }
 
     window.addEventListener("beforeunload", () => {
       flushActiveReadingSession();
@@ -10285,6 +11557,21 @@
     if (els.studyModal) {
       els.studyModal.addEventListener("click", (e) => {
         if (e.target === els.studyModal) els.studyModal.classList.add("hidden");
+      });
+    }
+    const btnStudyOpenPartner = document.getElementById("btn-study-open-partner");
+    if (btnStudyOpenPartner) {
+      btnStudyOpenPartner.addEventListener("click", () => {
+        const pid = btnStudyOpenPartner.dataset.partnerId;
+        if (!pid) return;
+        const found =
+          state.books.find((b) => b.id === pid) ||
+          (state.archivedBooks || []).find((b) => b.id === pid) || {
+            id: pid,
+            title: btnStudyOpenPartner.dataset.partnerTitle || pid,
+            language: btnStudyOpenPartner.dataset.partnerLang || "es",
+          };
+        openStudyModal(found, currentActiveStudyTab || "habits");
       });
     }
     document.querySelectorAll(".study-tab").forEach((btn) => {
@@ -10806,6 +12093,10 @@
     // Modal de Modelos TTS Locales (Piper MIT & Kokoro 82M Apache 2.0)
     els.btnOpenModels.addEventListener("click", async () => {
       els.modelsModal.classList.remove("hidden");
+      renderTtsUpdatesPanel();
+      if (!state.ttsUpdatesData) {
+        checkTtsEngineUpdates({ force: false, notifyToast: false }).catch(() => {});
+      }
       await fetchVoices();
     });
     els.btnCloseModels.addEventListener("click", () => {
@@ -11108,10 +12399,10 @@
       } else if (e.code === "ArrowRight") {
         e.preventDefault();
         jumpToSentence(state.sentenceIndex + 1);
-      } else if (e.code === "PageDown" && state.flowMode === "paginated") {
+      } else if (e.code === "PageDown" && state.flowMode === "paginated" && state.readerUiMode !== "audiobook") {
         e.preventDefault();
         turnPage(1);
-      } else if (e.code === "PageUp" && state.flowMode === "paginated") {
+      } else if (e.code === "PageUp" && state.flowMode === "paginated" && state.readerUiMode !== "audiobook") {
         e.preventDefault();
         turnPage(-1);
       }
@@ -11249,6 +12540,7 @@
     await Promise.all([fetchVoices(), fetchLibrary()]);
     refreshExportsStatus().catch(() => {});
     fetchReadingAnalytics().catch(() => {});
+    checkTtsEngineUpdates({ force: false, notifyToast: true }).catch(() => {});
   }
 
   init();
