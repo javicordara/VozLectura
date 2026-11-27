@@ -1,4 +1,4 @@
-const CACHE_NAME = "vozlectura-pwa-1.1.0";
+const CACHE_NAME = "vozlectura-pwa-1.2.0";
 const ASSETS_CACHE_NAME = "vozlectura-book-assets-v1";
 const STATIC_ASSETS = [
   "/",

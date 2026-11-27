@@ -1,9 +1,35 @@
 (() => {
   "use strict";
 
-  const APP_VERSION = "1.1.0";
+  const APP_VERSION = "1.2.0";
   const ACTIVE_PORT = (window.location && window.location.port) ? window.location.port : "8085";
   const DEFAULT_STATIC_SERVER_URL = `http://localhost:${ACTIVE_PORT}`;
+
+  function getChapterMeta(book, chapterIndex) {
+    if (!book) return null;
+    const list = book.chapters_summary || book.chapters || [];
+    const idx = Number(chapterIndex || 0);
+    return list.find((c) => Number(c.index) === idx) || list[idx] || null;
+  }
+
+  function getChapterDisplayLabel(book, chapterIndex, fallbackObj = null) {
+    const idx = Number(chapterIndex || 0);
+    if (fallbackObj && fallbackObj.title) return String(fallbackObj.title).trim();
+    const meta = getChapterMeta(book, idx);
+    if (meta && meta.title) return String(meta.title).trim();
+    const isEn = String((book && book.language) || "").toLowerCase().startsWith("en");
+    return isEn ? `Section ${idx + 1}` : `Sección ${idx + 1}`;
+  }
+
+  function getBookStoryChapterCount(book) {
+    if (!book) return 0;
+    if (Number(book.story_chapter_count) > 0) return Number(book.story_chapter_count);
+    const list = book.chapters_summary || book.chapters || [];
+    const storyCnt = list.filter((c) =>
+      ["prologue", "chapter", "interlude", "epilogue"].includes(c.kind)
+    ).length;
+    return storyCnt > 0 ? storyCnt : Number(book.chapter_count || list.length || 0);
+  }
 
   const state = {
     books: [],
@@ -2204,7 +2230,7 @@
     if (book) {
       if (els.miniPlayerTitle) els.miniPlayerTitle.textContent = book.title || "";
       if (els.miniPlayerChapter) {
-        const chTitle = (ch && ch.title) || `Capítulo ${state.chapterIndex + 1}`;
+        const chTitle = getChapterDisplayLabel(book, state.chapterIndex, ch);
         const stats = computeBookProgressStats(book, state.chapterIndex, curIdx);
         els.miniPlayerChapter.textContent = `${chTitle} • ${stats.percentStr}`;
       }
@@ -2234,12 +2260,10 @@
     if (els.abBookTitle) els.abBookTitle.textContent = book.title || "";
     if (els.abBookAuthor) els.abBookAuthor.textContent = book.author || "";
     if (els.abChapterTitle) {
-      const rawChTitle = ch && ch.title ? String(ch.title).trim() : "";
-      els.abChapterTitle.textContent = rawChTitle
-        ? /^\d+$/.test(rawChTitle)
-          ? `Capítulo ${rawChTitle}`
-          : rawChTitle
-        : `Capítulo ${state.chapterIndex + 1} de ${book.chapter_count || 1}`;
+      const rawChTitle = getChapterDisplayLabel(book, state.chapterIndex, ch);
+      els.abChapterTitle.textContent = /^\d+$/.test(rawChTitle)
+        ? `Capítulo ${rawChTitle}`
+        : rawChTitle;
     }
     if (els.abCoverWrap) {
       els.abCoverWrap.classList.toggle("is-playing", Boolean(state.isPlaying && !state.isLoadingAudio));
@@ -3539,10 +3563,11 @@
       const prog = book.progress || { chapter_index: 0, sentence_index: 0 };
       const progStats = computeBookProgressStats(book);
       const effStatus = getBookEffectiveStatus(book);
-      const chNum =
-        effStatus === "completed" || progStats.isCompleted
-          ? Math.max(1, Number(book.chapter_count || 1))
-          : (prog.chapter_index || 0) + 1;
+      const isBookDone = effStatus === "completed" || progStats.isCompleted;
+      const currentChLabel = isBookDone
+        ? "Completado"
+        : getChapterDisplayLabel(book, prog.chapter_index || 0);
+      const storyChCount = getBookStoryChapterCount(book);
       const pairing = book.pairing;
 
       let bilingualSwitcherHtml = "";
@@ -3582,10 +3607,10 @@
         const inactStats = computeBookProgressStats(inactiveBook);
         const inactProg = inactiveBook.progress || { chapter_index: 0, sentence_index: 0 };
         const inactStatus = getBookEffectiveStatus(inactiveBook);
-        const inactChNum =
-          inactStatus === "completed" || inactStats.isCompleted
-            ? Math.max(1, Number(inactiveBook.chapter_count || 1))
-            : (inactProg.chapter_index || 0) + 1;
+        const inactDone = inactStatus === "completed" || inactStats.isCompleted;
+        const inactChLabel = inactDone
+          ? "Completado"
+          : getChapterDisplayLabel(inactiveBook, inactProg.chapter_index || 0);
         const inactLocal = state.offlineBooksMap.has(inactiveBook.id) ? " • 📲 Local" : "";
 
         pairBadgeHtml = `
@@ -3595,7 +3620,7 @@
             title="Pulsa para conmutar la tarjeta a «${escapeHtml(inactiveBook.title)}»"
           >
             <span class="bilingual-partner-title">🔗 Pareja: <strong>${inactFlag} ${escapeHtml(inactiveBook.title)}</strong></span>
-            <span class="bilingual-partner-stats">📘 ${inactStats.percentStr} (Cap. ${inactChNum}/${inactiveBook.chapter_count})${inactLocal} ⇄</span>
+            <span class="bilingual-partner-stats">📘 ${inactStats.percentStr} • ${escapeHtml(inactChLabel)}${inactLocal} ⇄</span>
           </div>
         `;
       } else if (pairing && pairing.paired_book_id) {
@@ -3653,11 +3678,12 @@
           const partials = Array.isArray(p.partial_chapters) ? p.partial_chapters : [];
           if (partials.length > 0) {
             const firstPart = partials[0];
-            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#f59e0b;font-weight:600" title="Pulsa en 📲 Local para reanudar desde el punto exacto">⚠️ Local incompleto: ${completeCnt}/${totalBookCh} cap. (Cap. ${firstPart.chapter_index + 1}: ${firstPart.saved}/${firstPart.total})</div>`;
+            const firstPartLbl = getChapterDisplayLabel(book, firstPart.chapter_index);
+            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#f59e0b;font-weight:600" title="Pulsa en 📲 Local para reanudar desde el punto exacto">⚠️ Local incompleto: ${completeCnt}/${totalBookCh} secciones (${escapeHtml(firstPartLbl)}: ${firstPart.saved}/${firstPart.total})</div>`;
           } else if (totalBookCh > 0 && completeCnt < totalBookCh) {
-            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#0284c7;font-weight:600">📲 Local (${completeCnt}/${totalBookCh} cap. con audio IA)</div>`;
+            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#0284c7;font-weight:600">📲 Local (${completeCnt}/${totalBookCh} secciones con audio IA)</div>`;
           } else {
-            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#16a34a;font-weight:600">📲 Local (✅ ${completeCnt}/${totalBookCh} cap. con audio IA)</div>`;
+            offlineBadgeHtml = `<div style="margin-top:3px;font-size:0.74rem;color:#16a34a;font-weight:600">📲 Local (✅ ${completeCnt}/${totalBookCh} secciones con audio IA)</div>`;
           }
         }
       }
@@ -3691,14 +3717,14 @@
               ${lastReadPillHtml}
               ${genrePillHtml}
               <span class="catalog-pill meta-pill" title="Páginas estimadas (~250 palabras/pág.)">📄 ${effPages} págs.</span>
-              <span class="catalog-pill meta-pill" title="${book.total_sentences} frases en ${book.chapter_count} capítulos">📚 ${book.chapter_count} cap.</span>
+              <span class="catalog-pill meta-pill" title="${book.total_sentences} frases • ${storyChCount} capítulos (${book.chapter_count} secciones en el EPUB)">📚 ${storyChCount} cap.</span>
               ${pubPillHtml}
               ${addedPillHtml}
             </div>
-            <div class="book-progress-row" title="${progStats.sentencesRead} de ${progStats.totalSentences} frases leídas">
+            <div class="book-progress-row" title="${progStats.sentencesRead} de ${progStats.totalSentences} frases leídas • ${escapeHtml(currentChLabel)}">
               <div class="book-progress-header">
                 <span>📘 Leído: <strong>${progStats.percentStr}</strong></span>
-                <span style="color:var(--text-secondary);font-weight:500">Cap. ${chNum}/${book.chapter_count}</span>
+                <span style="color:var(--text-secondary);font-weight:500;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escapeHtml(currentChLabel)}">${escapeHtml(currentChLabel)}</span>
               </div>
               <div class="book-progress-track">
                 <div class="book-progress-fill ${progStats.isCompleted ? "completed" : ""}" style="width:${Math.min(100, progStats.percent).toFixed(1)}%"></div>
@@ -4633,17 +4659,46 @@
     els.tocList.innerHTML = "";
     if (!state.currentBook) return;
 
-    for (const ch of state.currentBook.chapters_summary || []) {
+    const list = state.currentBook.chapters_summary || [];
+    let lastRenderedPart = "";
+
+    for (const ch of list) {
+      const kind = ch.kind || "chapter";
+      const partTitle = (ch.part_title || "").trim();
+      const isDivider = kind === "divider";
+      const isMetaSection = kind === "front_matter" || kind === "back_matter";
+
+      // Si el capítulo pertenece a una Parte/Libro cuya portadilla no existía como item propio, insertar cabecera visual
+      if (!isDivider && partTitle && partTitle !== lastRenderedPart) {
+        const headerLi = document.createElement("li");
+        headerLi.className = "toc-part-header";
+        headerLi.textContent = partTitle;
+        els.tocList.appendChild(headerLi);
+        lastRenderedPart = partTitle;
+      } else if (isDivider) {
+        lastRenderedPart = (ch.title || "").trim();
+      } else if (!partTitle) {
+        lastRenderedPart = "";
+      }
+
       const li = document.createElement("li");
-      li.className = `toc-item ${ch.index === state.chapterIndex ? "active" : ""}`;
+      const cls = ["toc-item"];
+      if (ch.index === state.chapterIndex) cls.push("active");
+      if (isDivider) cls.push("toc-divider");
+      if (!isDivider && partTitle) cls.push("toc-child");
+      if (isMetaSection) cls.push("toc-meta-section");
+      li.className = cls.join(" ");
+
       const savedSent =
         ch.index === state.chapterIndex
           ? state.sentenceIndex
           : getSavedSentenceForChapter(state.currentBook, ch.index);
       const savedBadge =
         savedSent > 0 ? ` • Frase ${savedSent + 1}/${ch.sentence_count}` : `${ch.sentence_count} fr.`;
+      const displayLabel = !isDivider && partTitle && ch.toc_title ? ch.toc_title : ch.title;
+      li.title = ch.title || displayLabel;
       li.innerHTML = `
-        <span>${escapeHtml(ch.title)}</span>
+        <span>${escapeHtml(displayLabel)}</span>
         <small>${savedBadge}</small>
       `;
       li.addEventListener("click", async () => {
@@ -4974,13 +5029,16 @@
       state.chapterIndex,
       state.sentenceIndex
     );
-    const chTotal = Math.max(1, Number(state.currentBook.chapter_count || 1));
-    const chNum = state.chapterIndex + 1;
+    const curChTitle = getChapterDisplayLabel(
+      state.currentBook,
+      state.chapterIndex,
+      state.currentChapter
+    );
 
     const badgeEl = document.getElementById("reader-book-progress-badge");
     if (badgeEl) {
-      badgeEl.textContent = `📘 Libro: ${stats.percentStr} leído (Cap. ${chNum}/${chTotal})`;
-      badgeEl.title = `Has leído ${stats.percentStr} del libro completo (${stats.sentencesRead} de ${stats.totalSentences} frases • Capítulo ${chNum} de ${chTotal})`;
+      badgeEl.textContent = `📘 Libro: ${stats.percentStr} leído • ${curChTitle}`;
+      badgeEl.title = `Has leído ${stats.percentStr} del libro completo (${stats.sentencesRead} de ${stats.totalSentences} frases • ${curChTitle})`;
     }
 
     if (els.paginationFooterLabel) {
@@ -4989,7 +5047,7 @@
 
     const chFooterPctEl = document.getElementById("chapter-footer-book-pct");
     if (chFooterPctEl) {
-      chFooterPctEl.textContent = `📘 ${stats.percentStr} del libro leído (Cap. ${chNum} de ${chTotal})`;
+      chFooterPctEl.textContent = `📘 ${stats.percentStr} del libro leído • ${curChTitle}`;
     }
   }
 
@@ -6218,7 +6276,7 @@
       const opt = document.createElement("option");
       opt.value = String(ch.index);
       const tag = ch.is_story === false ? " • Portadilla/Preliminar" : "";
-      opt.textContent = `Cap. ${ch.index + 1}: ${ch.title} (${ch.sentence_count || 0} fr.${tag})`;
+      opt.textContent = `${ch.title} (${ch.sentence_count || 0} fr.${tag})`;
       els.pairChSource.appendChild(opt);
     }
 
@@ -6231,7 +6289,7 @@
       const opt = document.createElement("option");
       opt.value = String(ch.index);
       const tag = ch.is_story === false ? " • Portadilla/Preliminar" : "";
-      opt.textContent = `Cap. ${ch.index + 1}: ${ch.title} (${ch.sentence_count || 0} fr.${tag})`;
+      opt.textContent = `${ch.title} (${ch.sentence_count || 0} fr.${tag})`;
       els.pairChTarget.appendChild(opt);
     }
 
@@ -6273,17 +6331,21 @@
     const tgtIdx = Number(els.pairChTarget.value || 0);
     const offset = tgtIdx - srcIdx;
     const mappedCount = Object.keys(pairingWorkingMap).length;
+    const srcCh = pairingPreviewData && (pairingPreviewData.book_a_chapters || [])[srcIdx];
+    const tgtCh = pairingPreviewData && (pairingPreviewData.book_b_chapters || [])[tgtIdx];
+    const srcLabel = (srcCh && srcCh.title) || `Sección ${srcIdx + 1}`;
+    const tgtLabel = (tgtCh && tgtCh.title) || `Sección ${tgtIdx + 1}`;
     if (offset === 0) {
       els.pairOffsetHint.textContent =
         mappedCount > 0
-          ? `Mapa inteligente activo (${mappedCount} cap. alineados) • En este par: desfase 0 (Cap. ${srcIdx + 1} ↔ Cap. ${tgtIdx + 1})`
-          : "Desfase de capítulos: 0 (ambos libros coinciden en numeración de capítulo)";
+          ? `Mapa inteligente activo (${mappedCount} secciones alineadas) • ${srcLabel} ↔ ${tgtLabel}`
+          : `Emparejado: ${srcLabel} ↔ ${tgtLabel}`;
     } else {
       const sign = offset > 0 ? `+${offset}` : String(offset);
       els.pairOffsetHint.textContent =
         mappedCount > 0
-          ? `Mapa inteligente activo (${mappedCount} cap. alineados) • En este par: desfase ${sign} (Cap. ${srcIdx + 1} ↔ Cap. ${tgtIdx + 1})`
-          : `Desfase de capítulos: ${sign} (Cap. ${srcIdx + 1} de este libro ↔ Cap. ${tgtIdx + 1} de la pareja)`;
+          ? `Mapa inteligente activo (${mappedCount} secciones alineadas) • ${srcLabel} ↔ ${tgtLabel} (desfase ${sign})`
+          : `${srcLabel} ↔ ${tgtLabel} (desfase ${sign})`;
     }
     renderPairingLivePreview(srcIdx, tgtIdx);
     highlightActiveRowInPairingTable(srcIdx);
@@ -6312,7 +6374,7 @@
     const tgtTextEl = document.getElementById("pair-prev-tgt-text");
     const tgtEndEl = document.getElementById("pair-prev-tgt-end");
 
-    if (srcTitleEl) srcTitleEl.textContent = `Cap. ${srcCh.index + 1}: ${srcCh.title}`;
+    if (srcTitleEl) srcTitleEl.textContent = srcCh.title;
     if (srcMetaEl) {
       srcMetaEl.textContent = `${srcCh.sentence_count} fr. ${srcCh.is_story ? "📖" : "📄"}`;
     }
@@ -6323,7 +6385,7 @@
       srcEndEl.textContent = srcCh.ending_preview ? `Final: «${srcCh.ending_preview}»` : "";
     }
 
-    if (tgtTitleEl) tgtTitleEl.textContent = `Cap. ${tgtCh.index + 1}: ${tgtCh.title}`;
+    if (tgtTitleEl) tgtTitleEl.textContent = tgtCh.title;
     if (tgtMetaEl) {
       tgtMetaEl.textContent = `${tgtCh.sentence_count} fr. ${tgtCh.is_story ? "📖" : "📄"}`;
     }
@@ -6405,7 +6467,7 @@
       for (const tc of tgtChapters) {
         const sel = Number(tc.index) === mappedTgt ? " selected" : "";
         optionsHtml.push(
-          `<option value="${tc.index}"${sel}>Cap. ${tc.index + 1}: ${escapeHtml(tc.title)} (${tc.sentence_count} fr.)</option>`
+          `<option value="${tc.index}"${sel}>${escapeHtml(tc.title)} (${tc.sentence_count} fr.)</option>`
         );
       }
 
@@ -6418,7 +6480,7 @@
       row.innerHTML = `
         <div>
           <div class="pair-map-cell-title">
-            <span>Cap. ${sIdx + 1}: ${escapeHtml(srcCh.title)}</span>
+            <span>${escapeHtml(srcCh.title)}</span>
             <span class="badge-pill" style="font-size:0.66rem">${srcCh.sentence_count} fr.</span>
           </div>
           <div class="pair-map-cell-snippet">${escapeHtml(srcCh.preview || "")}</div>
@@ -8587,7 +8649,7 @@
             ? `${s.start_chapter_title} → ${s.end_chapter_title}`
             : s.end_chapter_title ||
               s.start_chapter_title ||
-              `Cap. ${(s.start_chapter ?? s.start_chapter_index ?? 0) + 1}`);
+              getChapterDisplayLabel(state.studyTargetBook, s.start_chapter ?? s.start_chapter_index ?? 0));
         card.innerHTML = `
           <div class="study-item-header">
             <div>
@@ -8634,7 +8696,7 @@
           <div class="study-item-header">
             <div>
               <span>${colorIcon}</span>
-              <strong>${escapeHtml(h.chapter_title || `Capítulo ${(h.chapter_index || 0) + 1}`)}</strong>
+              <strong>${escapeHtml(h.chapter_title || getChapterDisplayLabel(state.studyTargetBook, h.chapter_index || 0))}</strong>
               <small style="color:var(--text-secondary);margin-left:6px">Frase ${hSentIdx + 1}</small>
             </div>
             <div style="display:flex;gap:6px">
@@ -8717,7 +8779,7 @@
             </div>
           </div>
           ${v.definitions_summary ? `<div style="font-size:0.83rem">${escapeHtml(v.definitions_summary)}</div>` : ""}
-          ${v.context_sentence ? `<div class="study-quote-text" style="font-size:0.81rem">«${escapeHtml(v.context_sentence)}» <small style="color:var(--text-secondary)">(${escapeHtml(v.chapter_title || `Cap. ${(v.chapter_index || 0) + 1}`)})</small></div>` : ""}
+          ${v.context_sentence ? `<div class="study-quote-text" style="font-size:0.81rem">«${escapeHtml(v.context_sentence)}» <small style="color:var(--text-secondary)">(${escapeHtml(v.chapter_title || getChapterDisplayLabel(state.studyTargetBook, v.chapter_index || 0))})</small></div>` : ""}
           ${
             vNote
               ? `<div style="font-size:0.83rem"><strong>📝 Nota:</strong> ${escapeHtml(vNote)}</div>`
@@ -9168,7 +9230,7 @@
     const chTitle =
       state.currentBook && state.currentBook.id === state.studyTargetBook.id && state.currentChapter
         ? state.currentChapter.title
-        : `Cap. ${chIdx + 1}`;
+        : getChapterDisplayLabel(state.studyTargetBook, chIdx);
 
     await fetch(`/api/books/${state.studyTargetBook.id}/study/sessions`, {
       method: "POST",
@@ -10369,12 +10431,13 @@
       const existingMap = (existingPack && existingPack.sentences_b64) || {};
       const existingCount = Object.keys(existingMap).length;
 
+      const chLbl = (chObj && chObj.title) || getChapterDisplayLabel(bundleData.book, chIdx);
       if (existingCount >= chTotalSents && chTotalSents > 0) {
         skippedChaptersCount++;
         const donePct = Math.round(((i + 1) / Math.max(1, countToDownload)) * 100);
         els.offlineDlPct.textContent = `${donePct}%`;
         els.offlineDlBar.style.width = `${donePct}%`;
-        els.offlineDlDetail.textContent = `${stepPrefix}✓ Cap. ${chIdx + 1}/${totalCh} ya estaba completo en memoria local (${existingCount} frases) — saltando...`;
+        els.offlineDlDetail.textContent = `${stepPrefix}✓ ${chLbl} (${i + 1}/${countToDownload}) ya estaba completo en memoria local (${existingCount} frases) — saltando...`;
         continue;
       }
 
@@ -10388,7 +10451,7 @@
       if (firstMissingIdx > 0 && resumedFromSentence === null) {
         resumedFromSentence = { chapter: chIdx + 1, sentence: firstMissingIdx + 1 };
         showToast(
-          `▶️ Reanudando «${bundleData.book.title}» desde Cap. ${chIdx + 1}, Frase ${firstMissingIdx + 1} (${existingCount} frases previas conservadas)`,
+          `▶️ Reanudando «${bundleData.book.title}» desde ${chLbl}, Frase ${firstMissingIdx + 1} (${existingCount} frases previas conservadas)`,
           5000
         );
       }
@@ -10402,10 +10465,10 @@
           1,
           Math.round(((i + chFraction) / Math.max(1, countToDownload)) * 100)
         );
-        els.offlineDlPhase.textContent = `${stepPrefix}«${bundleData.book.title}» (${voiceName}) — Cap. ${chIdx + 1} de ${totalCh}...`;
+        els.offlineDlPhase.textContent = `${stepPrefix}«${bundleData.book.title}» (${voiceName}) — ${chLbl} (${i + 1}/${totalCh})...`;
         els.offlineDlPct.textContent = `${pct}%`;
         els.offlineDlBar.style.width = `${pct}%`;
-        els.offlineDlDetail.textContent = `Cap. ${chIdx + 1}: guardando frases ${sStart + 1}–${sEnd} de ${chTotalSents}...`;
+        els.offlineDlDetail.textContent = `${chLbl}: guardando frases ${sStart + 1}–${sEnd} de ${chTotalSents}...`;
 
         let audioPack = null;
         let lastErr = null;
@@ -10429,7 +10492,7 @@
             if (!resAudio.ok) {
               const err = await resAudio.json().catch(() => ({}));
               throw new Error(
-                err.detail || `Error HTTP ${resAudio.status} en capítulo ${chIdx + 1}`
+                err.detail || `Error HTTP ${resAudio.status} en ${chLbl}`
               );
             }
             audioPack = await resAudio.json();
@@ -10440,7 +10503,7 @@
             if (state.offlineDlCancel) break;
             if (attempt < 4) {
               const waitSec = attempt * 2;
-              els.offlineDlDetail.textContent = `⏳ Pausa momentánea de red/pantalla en Cap. ${chIdx + 1} (frase ${sStart + 1}) — Reintentando automáticamente (${attempt}/4 en ${waitSec}s)...`;
+              els.offlineDlDetail.textContent = `⏳ Pausa momentánea de red/pantalla en ${chLbl} (frase ${sStart + 1}) — Reintentando automáticamente (${attempt}/4 en ${waitSec}s)...`;
               await new Promise((r) => setTimeout(r, waitSec * 1000));
             }
           }
@@ -10448,7 +10511,7 @@
 
         if (lastErr) {
           throw new Error(
-            `Descarga pausada en «${bundleData.book.title}» Cap. ${chIdx + 1}, Frase ${sStart + 1} (${lastErr.message}). Todo lo anterior quedó guardado: pulsa «▶️ Continuar descarga» para retomar desde aquí.`
+            `Descarga pausada en «${bundleData.book.title}» ${chLbl}, Frase ${sStart + 1} (${lastErr.message}). Todo lo anterior quedó guardado: pulsa «▶️ Continuar descarga» para retomar desde aquí.`
           );
         }
 
@@ -10629,12 +10692,13 @@
 
                 if (partials.length > 0) {
                   const pt = partials[0];
-                  return `⚠️ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>${completeArr.length}/${totalBookCh} cap. completos</strong> (${pctSents}% del libro) • <span style="color:#f59e0b;font-weight:600">Se interrumpió en Cap. ${pt.chapter_index + 1} (frase ${pt.saved} de ${pt.total})</span>`;
+                  const ptLbl = getChapterDisplayLabel(b, pt.chapter_index);
+                  return `⚠️ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>${completeArr.length}/${totalBookCh} secciones completas</strong> (${pctSents}% del libro) • <span style="color:#f59e0b;font-weight:600">Se interrumpió en ${escapeHtml(ptLbl)} (frase ${pt.saved} de ${pt.total})</span>`;
                 }
                 if (totalBookCh > 0 && completeArr.length < totalBookCh) {
-                  return `⏳ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>${completeArr.length}/${totalBookCh} cap. descargados</strong> (${pctSents}% del libro — faltan ${totalBookCh - completeArr.length} cap.)`;
+                  return `⏳ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>${completeArr.length}/${totalBookCh} secciones descargadas</strong> (${pctSents}% del libro — faltan ${totalBookCh - completeArr.length})`;
                 }
-                return `✅ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>100% completo (${completeArr.length}/${totalBookCh} cap. • ${savedSents} frases verificadas)</strong>`;
+                return `✅ <strong>${escapeHtml(p.voice_name)}</strong> (${p.speed}×): <strong>100% completo (${completeArr.length}/${totalBookCh} secciones • ${savedSents} frases verificadas)</strong>`;
               })
               .join("<br/>")
           : "📖 Solo texto y notas (sin pistas de audio IA descargadas)";

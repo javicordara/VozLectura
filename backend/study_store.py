@@ -148,6 +148,102 @@ class BookStudyStore:
                 pass
         return {"id": book_id, "title": book_id, "author": "Desconocido", "language": "es"}
 
+    def _get_chapter_title_map_unlocked(self, book_id: str) -> Dict[int, str]:
+        """Devuelve mapa {chapter_index: canonical_title} desde metadata.json o chapters.json."""
+        title_map: Dict[int, str] = {}
+        meta = self._get_book_meta(book_id)
+        for ch in (meta.get("chapters") or meta.get("chapters_summary") or []):
+            if isinstance(ch, dict) and ch.get("index") is not None and ch.get("title"):
+                try:
+                    title_map[int(ch["index"])] = str(ch["title"]).strip()
+                except Exception:
+                    pass
+        if title_map:
+            return title_map
+        ch_file = self.books_dir / book_id / "chapters.json"
+        if ch_file.exists():
+            try:
+                raw_chs = json.loads(ch_file.read_text(encoding="utf-8"))
+                if isinstance(raw_chs, list):
+                    for idx_pos, ch in enumerate(raw_chs):
+                        if isinstance(ch, dict) and ch.get("title"):
+                            title_map[int(ch.get("index", idx_pos))] = str(ch["title"]).strip()
+            except Exception:
+                pass
+        return title_map
+
+    def refresh_book_chapter_titles(
+        self,
+        book_id: str,
+        chapters_meta: List[Dict[str, Any]],
+        story_indices: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Actualiza títulos de capítulos en highlights, vocabulario y sesiones y re-sincroniza Obsidian."""
+        title_map: Dict[int, str] = {}
+        for cm in (chapters_meta or []):
+            if isinstance(cm, dict) and cm.get("index") is not None and cm.get("title"):
+                try:
+                    title_map[int(cm["index"])] = str(cm["title"]).strip()
+                except Exception:
+                    pass
+        if not title_map:
+            return {"ok": False, "updated": False}
+
+        with self._lock:
+            sf = self._study_file(book_id)
+            obs_local = self.books_dir / book_id / "obsidian_note.md"
+            if not sf.exists() and not obs_local.exists():
+                return {"ok": True, "updated": False}
+
+            data = self._load_unlocked(book_id)
+            changed = False
+
+            for h in (data.get("highlights") or []):
+                if not isinstance(h, dict):
+                    continue
+                c_idx = h.get("chapter_index")
+                if c_idx is not None:
+                    try:
+                        ci = int(c_idx)
+                        if ci in title_map and h.get("chapter_title") != title_map[ci]:
+                            h["chapter_title"] = title_map[ci]
+                            changed = True
+                    except Exception:
+                        pass
+
+            for v in (data.get("vocabulary") or []):
+                if not isinstance(v, dict):
+                    continue
+                c_idx = v.get("chapter_index")
+                if c_idx is not None:
+                    try:
+                        ci = int(c_idx)
+                        if ci in title_map and v.get("chapter_title") != title_map[ci]:
+                            v["chapter_title"] = title_map[ci]
+                            changed = True
+                    except Exception:
+                        pass
+
+            for s in (data.get("sessions") or []):
+                if not isinstance(s, dict):
+                    continue
+                ec = s.get("end_chapter")
+                sc = s.get("start_chapter")
+                try:
+                    ec_i = int(ec if ec is not None else (sc or 0))
+                    sc_i = int(sc if sc is not None else ec_i)
+                    new_lbl = title_map.get(ec_i) or title_map.get(sc_i)
+                    if new_lbl and s.get("chapter_title") != new_lbl:
+                        s["chapter_title"] = new_lbl
+                        changed = True
+                except Exception:
+                    pass
+
+            if changed or bool(data.get("sessions")):
+                self._save_unlocked(book_id, data)
+                return {"ok": True, "updated": True}
+            return {"ok": True, "updated": False}
+
     def _default_study_data(self, book_id: str) -> Dict[str, Any]:
         meta = self._get_book_meta(book_id)
         now = int(time.time())
@@ -1040,6 +1136,8 @@ class BookStudyStore:
         ):
             return False
         recovered: List[Dict[str, Any]] = []
+        ch_title_map = self._get_chapter_title_map_unlocked(str(data.get("book_id") or ""))
+        title_to_idx = {v.lower(): k for k, v in ch_title_map.items()}
         for raw_line in sec_body.splitlines():
             s = raw_line.strip()
             if (
@@ -1079,6 +1177,15 @@ class BookStudyStore:
                 ec = max(sc, int(m_ch_rng.group(2) or m_ch_rng.group(1)) - 1)
                 if m_ch_rng.group(3):
                     ch_title = m_ch_rng.group(3).strip()
+            elif " → " in ch_s:
+                s_part, e_part = [p.strip() for p in ch_s.split(" → ", 1)]
+                sc = title_to_idx.get(s_part.lower(), 0)
+                ec = title_to_idx.get(e_part.lower(), sc)
+                ch_title = e_part or s_part
+            elif ch_s.lower() in title_to_idx:
+                sc = title_to_idx[ch_s.lower()]
+                ec = sc
+                ch_title = ch_s
             try:
                 sents_read = max(0, int(fr_s))
             except Exception:
@@ -1341,6 +1448,11 @@ class BookStudyStore:
                 existing["updated_at"] = now
                 entry = existing
             else:
+                ch_title_map = self._get_chapter_title_map_unlocked(book_id)
+                resolved_voc_title = (
+                    ch_title_map.get(int(chapter_index))
+                    or (chapter_title or "").strip()
+                )
                 entry = {
                     "id": f"voc_{uuid.uuid4().hex[:10]}",
                     "word": clean_w,
@@ -1352,7 +1464,7 @@ class BookStudyStore:
                     "context_sentence": context_sentence,
                     "context_translation": context_translation,
                     "chapter_index": chapter_index,
-                    "chapter_title": chapter_title,
+                    "chapter_title": resolved_voc_title,
                     "sentence_index": sentence_index,
                     "user_note": user_note,
                     "note": user_note,
@@ -1410,13 +1522,19 @@ class BookStudyStore:
             hl_list: List[Dict[str, Any]] = data.get("highlights") or []
             now = int(time.time())
 
+            ch_title_map = self._get_chapter_title_map_unlocked(book_id)
+            resolved_ch_title = (
+                ch_title_map.get(int(chapter_index))
+                or (chapter_title or "").strip()
+                or f"Capítulo {chapter_index + 1}"
+            )
             entry = {
                 "id": f"hl_{uuid.uuid4().hex[:10]}",
                 "text": clean_txt,
                 "note": (note or "").strip(),
                 "color": color if color in ("yellow", "green", "blue", "pink") else "yellow",
                 "chapter_index": chapter_index,
-                "chapter_title": chapter_title or f"Capítulo {chapter_index + 1}",
+                "chapter_title": resolved_ch_title,
                 "sentence_indices": sentence_indices or [],
                 "created_at": now,
                 "updated_at": now,
@@ -1533,6 +1651,14 @@ class BookStudyStore:
                     (s for s in sessions if s.get("id") == session_id), None
                 )
 
+            ch_title_map = self._get_chapter_title_map_unlocked(book_id)
+            resolved_sess_title = (
+                ch_title_map.get(int(end_chapter))
+                or (chapter_title or "").strip()
+                or ch_title_map.get(int(start_chapter))
+                or f"Capítulo {end_chapter + 1}"
+            )
+
             if existing:
                 new_sents = max(int(existing.get("sentences_read") or 0), clean_sents)
                 existing["sentences_read"] = new_sents
@@ -1552,8 +1678,8 @@ class BookStudyStore:
                     int(existing.get("started_at") or now) + int(existing["duration_seconds"])
                 )
                 existing["end_chapter"] = end_chapter
-                if chapter_title:
-                    existing["chapter_title"] = chapter_title
+                if resolved_sess_title:
+                    existing["chapter_title"] = resolved_sess_title
                 if note:
                     existing["note"] = note
                 session_entry = existing
@@ -1574,7 +1700,7 @@ class BookStudyStore:
                     "duration_seconds": clean_dur,
                     "start_chapter": start_chapter,
                     "end_chapter": end_chapter,
-                    "chapter_title": chapter_title or f"Capítulo {end_chapter + 1}",
+                    "chapter_title": resolved_sess_title,
                     "sentences_read": clean_sents,
                     "note": note,
                 }
@@ -1828,10 +1954,13 @@ class BookStudyStore:
                     int(h.get("created_at") or 0),
                 ),
             )
+            ch_title_map_md = self._get_chapter_title_map_unlocked(str(data.get("book_id") or ""))
             for h in sorted_hl:
-                ch_num_hl = int(h.get("chapter_index") or 0) + 1
-                ch_label = h.get("chapter_title") or (
-                    f"Chapter {ch_num_hl}" if is_en else f"Capítulo {ch_num_hl}"
+                ch_idx_hl = int(h.get("chapter_index") or 0)
+                ch_label = (
+                    ch_title_map_md.get(ch_idx_hl)
+                    or h.get("chapter_title")
+                    or (f"Chapter {ch_idx_hl + 1}" if is_en else f"Capítulo {ch_idx_hl + 1}")
                 )
                 date_str = _format_ts_datetime(h.get("created_at"))
                 lines.append(f"### 📍 {ch_label} _({date_str})_")
@@ -1862,14 +1991,17 @@ class BookStudyStore:
             )
         else:
             lines.append("")
+            ch_title_map_voc = self._get_chapter_title_map_unlocked(str(data.get("book_id") or ""))
             for v in vocab:
                 w = v.get("word", "")
                 phon = f" `/{v['phonetic']}/`" if v.get("phonetic") else ""
                 trans = v.get("translation") or "—"
                 count = int(v.get("lookup_count") or 1)
-                ch_num_v = int(v.get("chapter_index") or 0) + 1
-                ch_label = v.get("chapter_title") or (
-                    f"Ch. {ch_num_v}" if is_en else f"Cap. {ch_num_v}"
+                ch_idx_v = int(v.get("chapter_index") or 0)
+                ch_label = (
+                    ch_title_map_voc.get(ch_idx_v)
+                    or v.get("chapter_title")
+                    or (f"Chapter {ch_idx_v + 1}" if is_en else f"Capítulo {ch_idx_v + 1}")
                 )
                 if is_en:
                     lines.append(
@@ -1916,6 +2048,7 @@ class BookStudyStore:
             else:
                 lines.append("| Fecha | Hora inicio | Duración | Capítulos | Frases | Nota |")
             lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+            ch_title_map_ses = self._get_chapter_title_map_unlocked(str(data.get("book_id") or ""))
             for s in sessions:
                 d_str = _format_ts_date(s.get("started_at"))
                 t_str = (
@@ -1924,14 +2057,24 @@ class BookStudyStore:
                     else "—"
                 )
                 dur_str = _format_duration_human(int(s.get("duration_seconds") or 0))
-                sc = int(s.get("start_chapter") or 0) + 1
-                ec = int(s.get("end_chapter") or 0) + 1
-                ch_prefix = "Ch." if is_en else "Cap."
-                ch_range = (
-                    f"{ch_prefix} {sc}" if sc == ec else f"{ch_prefix} {sc} → {ec}"
+                sc_idx = int(s.get("start_chapter") or 0)
+                ec_idx = int(s.get("end_chapter") or 0)
+                saved_title = (s.get("chapter_title") or "").strip()
+                start_lbl = (
+                    ch_title_map_ses.get(sc_idx)
+                    or (saved_title if sc_idx == ec_idx else "")
+                    or (f"Chapter {sc_idx + 1}" if is_en else f"Capítulo {sc_idx + 1}")
                 )
-                if s.get("chapter_title"):
-                    ch_range += f" ({s['chapter_title']})"
+                end_lbl = (
+                    ch_title_map_ses.get(ec_idx)
+                    or saved_title
+                    or (f"Chapter {ec_idx + 1}" if is_en else f"Capítulo {ec_idx + 1}")
+                )
+                if sc_idx == ec_idx or start_lbl == end_lbl:
+                    ch_range = end_lbl or start_lbl
+                else:
+                    ch_range = f"{start_lbl} → {end_lbl}"
+                ch_range = ch_range.replace("|", "/")
                 fr_count = int(s.get("sentences_read") or 0)
                 s_note = (s.get("note") or "").replace("|", "/")
                 lines.append(
@@ -2170,6 +2313,7 @@ class BookStudyStore:
                 rating = _normalize_half_star_rating(study.get("rating"))
 
                 # Registrar sesiones en el calendario diario
+                book_ch_titles = self._get_chapter_title_map_unlocked(book_id)
                 for s in sessions:
                     s_ts = int(s.get("started_at") or 0)
                     if s_ts <= 0:
@@ -2179,11 +2323,16 @@ class BookStudyStore:
                     years_set.add(s_dt.year)
                     dur_s = max(1, int(s.get("duration_seconds") or 0))
                     sents_r = max(0, int(s.get("sentences_read") or 0))
-                    sc = int(s.get("start_chapter") or 0) + 1
-                    ec = int(s.get("end_chapter") or 0) + 1
-                    ch_range = f"Cap. {sc}" if sc == ec else f"Cap. {sc} → {ec}"
-                    if s.get("chapter_title"):
-                        ch_range = s["chapter_title"]
+                    sc_idx = int(s.get("start_chapter") or 0)
+                    ec_idx = int(s.get("end_chapter") or 0)
+                    st_lbl = book_ch_titles.get(sc_idx) or (s.get("chapter_title") or "").strip()
+                    ed_lbl = book_ch_titles.get(ec_idx) or (s.get("chapter_title") or "").strip()
+                    if st_lbl and ed_lbl and st_lbl != ed_lbl and sc_idx != ec_idx:
+                        ch_range = f"{st_lbl} → {ed_lbl}"
+                    elif ed_lbl or st_lbl:
+                        ch_range = ed_lbl or st_lbl
+                    else:
+                        ch_range = f"Sección {sc_idx + 1}" if sc_idx == ec_idx else f"Sección {sc_idx + 1} → {ec_idx + 1}"
 
                     if d_key not in daily_map:
                         daily_map[d_key] = {

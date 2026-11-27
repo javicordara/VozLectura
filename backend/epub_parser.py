@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import time
+import unicodedata
 import urllib.parse
 import wave
 import xml.etree.ElementTree as ET
@@ -17,6 +18,224 @@ from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup, NavigableString, Tag
 
 logger = logging.getLogger("epub_tts.parser")
+
+_MINOR_TITLE_WORDS = {
+    "a", "al", "an", "and", "as", "at", "by", "con", "de", "del", "e", "el", "en",
+    "for", "from", "in", "la", "las", "los", "o", "of", "on", "or", "para", "por",
+    "the", "to", "u", "un", "una", "with", "y",
+}
+
+_ROMAN_TOKENS = {
+    "i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+    "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx",
+    "xxi", "xxii", "xxiii", "xxiv", "xxv", "xxvi", "xxvii", "xxviii", "xxix", "xxx",
+}
+
+_KEEP_UPPER_TOKENS = _ROMAN_TOKENS | {"est", "ast", "mst", "pst", "cst", "edt", "gmt", "utc", "ai", "tv", "fbi", "cia"}
+
+_SPELLED_NUMBERS_RE = re.compile(
+    r"^(?:"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|"
+    r"fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|"
+    r"seventy|eighty|ninety|hundred|"
+    r"uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce|trece|catorce|"
+    r"quince|dieciseis|diecisiete|dieciocho|diecinueve|veinte|veintiuno|veintidos|"
+    r"veintitres|veinticuatro|veinticinco|veintiseis|veintisiete|veintiocho|veintinueve|"
+    r"treinta|cuarenta|cincuenta|sesenta|setenta|ochenta|noventa|cien|"
+    r"primero|segundo|tercero|cuarto|quinto|sexto|septimo|octavo|noveno|decimo"
+    r")(?:(?:\s+y\s+|\s+and\s+|[\s-])(?:one|two|three|four|five|six|seven|eight|nine|uno|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve))?$",
+    re.I,
+)
+
+_FRONT_MATTER_TITLE_KW = (
+    "title page", "portada", "cubierta", "portadilla", "half title",
+    "copyright", "creditos", "credits", "colofon", "colophon",
+    "dedication", "dedicatoria", "epigraph", "epigrafe", "cita", "citas",
+    "contents", "table of contents", "indice", "sumario",
+    "sinopsis", "synopsis", "publisher info", "informacion editorial",
+    "sobre este libro", "front matter", "preliminar", "definition",
+    "anniversary edition", "edicion conmemorativa", "edicion especial",
+)
+
+_BACK_MATTER_TITLE_KW = (
+    "acknowledgment", "acknowledgments", "acknowledgement", "acknowledgements",
+    "agradecimiento", "agradecimientos", "about the author", "sobre el autor",
+    "about the publisher", "sobre la editorial", "also by", "other works",
+    "otras obras", "otros titulos", "mailing list", "patreon", "facebook group", "facebook groups",
+    "praise", "critical acclaim", "nota del autor", "author's note", "authors note",
+    "notas", "notes", "nota", "bibliography", "bibliografia", "glossary", "glosario",
+    "bookperk", "it's over", "its over", "one more", "proxima lectura",
+    "sobre matt", "credits", "creditos", "copyright", "back matter",
+    "material adicional", "bonus chapter", "anexo narrativo",
+)
+
+_DIVIDER_TITLE_RE = re.compile(
+    r"^(?:"
+    r"(?:part|parte|book|libro|act|acto|volume|volumen|section|seccion|heat|horrible)\s+"
+    r"(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)"
+    r"|(?:primera|segunda|tercera|cuarta|quinta|sexta|septima|octava|novena|decima|first|second|third|fourth|fifth|sixth)\s+"
+    r"(?:parte|part|libro|book)"
+    r")\b",
+    re.I,
+)
+
+
+def _strip_accents_lower(text: str) -> str:
+    norm = (
+        unicodedata.normalize("NFKD", str(text or ""))
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    return re.sub(r"\s+", " ", norm).lower().strip()
+
+
+def _extract_clean_element_text(el: Tag) -> str:
+    """Extrae texto de un elemento HTML sin romper drop-caps (<span>T</span>he) pero respetando <br>."""
+    if el is None:
+        return ""
+    clone = BeautifulSoup(str(el), "html.parser")
+    for br in clone.find_all("br"):
+        br.replace_with(" ")
+    for blk in clone.find_all(["p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6"]):
+        blk.insert_before(" ")
+        blk.insert_after(" ")
+    raw = clone.get_text("")
+    return _clean_heading_text(raw)
+
+
+def _clean_heading_text(raw: str) -> str:
+    txt = str(raw or "").replace("\xa0", " ")
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if not txt:
+        return ""
+    # Arreglar ordinales rotos por <sup>: "40 th" -> "40th"
+    txt = re.sub(r"\b(\d+)\s+(st|nd|rd|th)\b", r"\1\2", txt, flags=re.I)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    return txt
+
+
+def _smart_title_case_token(tok: str, is_first: bool) -> str:
+    # Preservar puntuación exterior («, ", (, :, .)
+    m = re.match(r"^([^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]*)(.*?)([^A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]*)$", tok)
+    if not m:
+        return tok
+    lead, core, trail = m.groups()
+    if not core:
+        return tok
+    low_core = _strip_accents_lower(core)
+    if low_core in _KEEP_UPPER_TOKENS:
+        return f"{lead}{core.upper()}{trail}"
+    if "-" in core and len(core) > 2:
+        parts = core.split("-")
+        rebuilt = "-".join(_smart_title_case_token(p, idx == 0 and is_first) for idx, p in enumerate(parts))
+        return f"{lead}{rebuilt}{trail}"
+    if not is_first and low_core in _MINOR_TITLE_WORDS:
+        return f"{lead}{core.lower()}{trail}"
+    return f"{lead}{core[:1].upper()}{core[1:].lower()}{trail}"
+
+
+def _normalize_heading_casing(text: str) -> str:
+    """Normaliza encabezados TODO MAYÚSCULAS a formato título limpio preservando romanos y siglas."""
+    txt = _clean_heading_text(text)
+    if not txt:
+        return ""
+    # Separar encabezado mixto "PRIMERA PARTE El Comienzo" -> "Primera Parte: El Comienzo"
+    m_mix = re.match(
+        r"^((?:PRIMERA|SEGUNDA|TERCERA|CUARTA|QUINTA|SEXTA|SÉPTIMA|OCTAVA|NOVENA|DÉCIMA)\s+PARTE|"
+        r"(?:PART|PARTE|BOOK|LIBRO)\s+(?:[IVXLCDM]+|\d+|ONE|TWO|THREE|FOUR|FIVE|SIX|UNO|DOS|TRES|CUATRO|CINCO))\s+(.+)$",
+        txt,
+    )
+    if m_mix:
+        head_p = _normalize_heading_casing(m_mix.group(1))
+        rest_p = m_mix.group(2).strip()
+        if rest_p and not rest_p.startswith((":", "—", "-")):
+            rest_norm = _normalize_heading_casing(rest_p) if rest_p.isupper() else rest_p
+            return f"{head_p}: {rest_norm}"
+
+    letters = [c for c in txt if c.isalpha()]
+    if len(letters) < 3:
+        return txt
+    upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+    if upper_ratio < 0.85:
+        return txt
+    # Si todo son romanos o siglas cortas (ej. "IV"), conservar
+    if len(txt) <= 4 and _strip_accents_lower(txt) in _KEEP_UPPER_TOKENS:
+        return txt.upper()
+
+    tokens = txt.split(" ")
+    out = [_smart_title_case_token(tok, i == 0) for i, tok in enumerate(tokens)]
+    return " ".join(out)
+
+
+def _shorten_part_prefix(part_title: str) -> str:
+    """Acorta un título de Parte/Libro para prefijo de capítulo: 'Part I: The Beginning' -> 'Part I'."""
+    pt = _normalize_heading_casing(part_title)
+    if not pt:
+        return ""
+    pt = re.sub(r"\s*\(texto\)\s*$", "", pt, flags=re.I).strip()
+    m_std = re.match(
+        r"^((?:Part|Parte|Book|Libro|Act|Acto)\s+(?:[IVXLCDM]+|\d+|One|Two|Three|Four|Five|Six|Seven|Eight|Nine|Ten|"
+        r"Uno|Dos|Tres|Cuatro|Cinco|Seis|Siete|Ocho|Nueve|Diez)|"
+        r"(?:Primera|Segunda|Tercera|Cuarta|Quinta|Sexta|Séptima|Octava|Novena|Décima|"
+        r"First|Second|Third|Fourth|Fifth|Sixth)\s+(?:Parte|Part|Libro|Book))\b",
+        pt,
+        re.I,
+    )
+    if m_std:
+        return m_std.group(1).strip()
+    if ":" in pt:
+        left = pt.split(":", 1)[0].strip()
+        if 2 <= len(left) <= 28:
+            return left
+    if " — " in pt:
+        left = pt.split(" — ", 1)[0].strip()
+        if 2 <= len(left) <= 28:
+            return left
+    return pt[:28].rstrip()
+
+
+def _normalize_toc_href(base_dir: str, raw_href: str) -> str:
+    target = str(raw_href or "").split("#", 1)[0].strip()
+    if not target:
+        return ""
+    unquoted = urllib.parse.unquote(target)
+    joined = posixpath.join(base_dir, unquoted) if base_dir else unquoted
+    norm = posixpath.normpath(joined).lstrip("/")
+    if norm.startswith("./"):
+        norm = norm[2:]
+    return norm
+
+
+def _is_standalone_chapter_lead(text: str) -> bool:
+    """Detecta encabezados de capítulo escritos en <p> dentro de EPUBs divididos (ej. 'UNO', '15:55 (EST)', '1', 'PRIMER INTERLUDIO')."""
+    t = _clean_heading_text(text)
+    if not t or len(t) > 58:
+        return False
+    norm = _strip_accents_lower(t)
+    # Descartar frases normales que terminan en punto/signos (salvo "1.", "2.", "p.m.", "(EST)")
+    if re.search(r"[!?…]$", t):
+        return False
+    if t.endswith(".") and not re.match(r"^(?:\d{1,3}|[ivxlcdm]{1,6})\.$", norm) and not re.search(r"\b(?:a\.m\.|p\.m\.)$", norm):
+        return False
+    # 1. Número arábigo o romano
+    if re.match(r"^(?:\d{1,3}|[ivxlcdm]{1,6})\.?$", norm):
+        return True
+    # 2. Número escrito en letras (UNO..CIEN, One..Hundred)
+    if _SPELLED_NUMBERS_RE.match(norm):
+        return True
+    # 3. Capítulo / Chapter / Prólogo / Epílogo / Interludio / Parte / Libro / Después: Uno
+    if re.match(
+        r"^(?:(?:chapter|capitulo|cap\.?|prologue|prologo|epilogue|epilogo|preface|prefacio|"
+        r"interlude|interludio|primer interludio|segundo interludio|tercer interludio|cuarto interludio|"
+        r"first interlude|second interlude|third interlude|fourth interlude|"
+        r"part|parte|book|libro)\b|(?:after|despues)\s*:)",
+        norm,
+    ):
+        return True
+    # 4. Hora / timestamp de capítulo (ej. "15:55 (EST)", "3:55 p.m. (EST)", "Año 0, día 0")
+    if re.match(r"^\d{1,2}:\d{2}\b", norm) or re.match(r"^(?:ano|year|dia|day)\s+-?\d+", norm):
+        return True
+    return False
 
 
 def parse_smil_clock(val: Optional[str]) -> Optional[float]:
@@ -176,7 +395,9 @@ class EpubParser:
             metadata = self._extract_metadata(opf_root, filename)
             manifest, id_to_href = self._extract_manifest(opf_root, opf_dir)
             spine_hrefs = self._extract_spine(opf_root, id_to_href)
-            toc_map = self._extract_toc(zf, opf_root, manifest, opf_dir)
+            toc_entries, _ = self._extract_toc_entries(
+                zf, opf_root, manifest, opf_dir, book_title=metadata["title"]
+            )
 
             # Extraer imágenes y recursos para poder mostrarlos en el visor
             self._extract_images(zf, manifest, assets_folder)
@@ -188,27 +409,41 @@ class EpubParser:
             smil_by_xhtml = self._extract_smil_overlays(zf, manifest)
 
             chapters: List[Dict[str, Any]] = []
+            chapter_title_contexts: List[Dict[str, Any]] = []
             pending_image_blocks: List[str] = []
+            pending_skipped_part: str = ""
+            namelist_set = set(zf.namelist())
+
             for idx, href in enumerate(spine_hrefs):
-                if href not in zf.namelist():
+                resolved_href = href
+                if resolved_href not in namelist_set:
                     # Intentar decodificar URL (%20, etc.)
-                    decoded_href = urllib.parse.unquote(href)
-                    if decoded_href in zf.namelist():
-                        href = decoded_href
+                    decoded_href = urllib.parse.unquote(resolved_href)
+                    if decoded_href in namelist_set:
+                        resolved_href = decoded_href
                     else:
                         continue
 
-                raw_html = zf.read(href).decode("utf-8", errors="replace")
-                chapter_dir = posixpath.dirname(href)
-                chapter_title = toc_map.get(href) or toc_map.get(urllib.parse.unquote(href))
+                norm_href = _normalize_toc_href("", resolved_href)
+                toc_entry = (
+                    toc_entries.get(norm_href)
+                    or toc_entries.get(norm_href.lower())
+                    or toc_entries.get(_normalize_toc_href("", href))
+                    or toc_entries.get(_normalize_toc_href("", href).lower())
+                )
+
+                raw_html = zf.read(resolved_href).decode("utf-8", errors="replace")
+                chapter_dir = posixpath.dirname(resolved_href)
+                chapter_title = toc_entry["label"] if toc_entry else None
                 chapter_smil_pars = (
-                    smil_by_xhtml.get(href)
-                    or smil_by_xhtml.get(urllib.parse.unquote(href))
-                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(href)}")
-                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(urllib.parse.unquote(href))}")
+                    smil_by_xhtml.get(resolved_href)
+                    or smil_by_xhtml.get(urllib.parse.unquote(resolved_href))
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(resolved_href)}")
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(urllib.parse.unquote(resolved_href))}")
                     or []
                 )
 
+                title_ctx = self._extract_html_title_context(raw_html, norm_href)
                 parsed_chapter = self._parse_chapter_html(
                     raw_html=raw_html,
                     chapter_index=len(chapters),
@@ -221,6 +456,8 @@ class EpubParser:
                 # Si la página no tiene texto pero sí ilustraciones (láminas/mapas entre capítulos),
                 # conservar sus imágenes adjuntándolas al capítulo contiguo sin alterar los índices.
                 if parsed_chapter["sentence_count"] == 0:
+                    if toc_entry and _DIVIDER_TITLE_RE.match(_strip_accents_lower(toc_entry["label"])):
+                        pending_skipped_part = _normalize_heading_casing(toc_entry["label"])
                     img_soup = BeautifulSoup(parsed_chapter.get("html") or "", "html.parser")
                     imgs = img_soup.find_all("img")
                     if imgs and not (len(chapters) == 0 and idx == 0 and cover_rel_path):
@@ -232,6 +469,10 @@ class EpubParser:
                     parsed_chapter["html"] = "".join(pending_image_blocks) + (parsed_chapter.get("html") or "")
                     pending_image_blocks.clear()
 
+                title_ctx["toc_entry"] = toc_entry
+                title_ctx["inherited_skipped_part"] = pending_skipped_part
+                pending_skipped_part = ""
+                chapter_title_contexts.append(title_ctx)
                 chapters.append(parsed_chapter)
 
             if pending_image_blocks and chapters:
@@ -256,6 +497,20 @@ class EpubParser:
             )
             detected_lang = self._detect_language_heuristic(sample_text, metadata["language"])
 
+        # Resolver nombres canónicos de capítulos usando jerarquía del índice (TOC) y metadatos HTML
+        self._resolve_book_chapter_titles(
+            chapters=chapters,
+            title_contexts=chapter_title_contexts,
+            book_title=metadata["title"],
+            book_lang=detected_lang,
+        )
+
+        story_chapter_count = sum(
+            1
+            for c in chapters
+            if c.get("kind") in {"prologue", "chapter", "interlude", "epilogue"}
+        ) or len(chapters)
+
         has_embedded_mo = embedded_overlay_count > 0
         total_words = sum(
             len((s.get("text") or "").split())
@@ -264,6 +519,19 @@ class EpubParser:
         )
         estimated_pages = max(1, round(total_words / 250)) if total_words > 0 else 1
         now_ts = int(time.time())
+
+        chapters_meta = [
+            {
+                "index": c["index"],
+                "title": c["title"],
+                "toc_title": c.get("toc_title") or c["title"],
+                "part_title": c.get("part_title") or "",
+                "in_toc": bool(c.get("in_toc", False)),
+                "kind": c.get("kind") or "chapter",
+                "sentence_count": c["sentence_count"],
+            }
+            for c in chapters
+        ]
 
         book_data: Dict[str, Any] = {
             "id": book_id,
@@ -280,6 +548,7 @@ class EpubParser:
             "estimated_pages": estimated_pages,
             "cover_url": f"/api/books/{book_id}/cover" if cover_rel_path else None,
             "chapter_count": len(chapters),
+            "story_chapter_count": story_chapter_count,
             "total_sentences": sum(c["sentence_count"] for c in chapters),
             "has_imported_audiobook": has_embedded_mo,
             "has_embedded_media_overlay": has_embedded_mo,
@@ -290,22 +559,8 @@ class EpubParser:
                 else None
             ),
             "_opf_enriched": True,
-            "chapters": [
-                {
-                    "index": c["index"],
-                    "title": c["title"],
-                    "sentence_count": c["sentence_count"],
-                }
-                for c in chapters
-            ],
-            "chapters_summary": [
-                {
-                    "index": c["index"],
-                    "title": c["title"],
-                    "sentence_count": c["sentence_count"],
-                }
-                for c in chapters
-            ],
+            "chapters": chapters_meta,
+            "chapters_summary": [dict(cm) for cm in chapters_meta],
         }
 
         # Guardar capítulos procesados en disco
@@ -523,51 +778,748 @@ class EpubParser:
         opf_root: ET.Element,
         manifest: Dict[str, Dict[str, str]],
         opf_dir: str,
+        book_title: str = "",
     ) -> Dict[str, str]:
-        """Mapea rutas de archivo de capítulo -> título del capítulo usando NCX o EPUB3 nav."""
-        toc_map: Dict[str, str] = {}
+        """Compatibilidad: devuelve mapa plano href -> etiqueta del índice."""
+        toc_entries, _ = self._extract_toc_entries(zf, opf_root, manifest, opf_dir, book_title=book_title)
+        return {k: v["label"] for k, v in toc_entries.items()}
 
-        # 1. Intentar EPUB 3 Nav Document
+    def _extract_toc_entries(
+        self,
+        zf: zipfile.ZipFile,
+        opf_root: ET.Element,
+        manifest: Dict[str, Dict[str, str]],
+        opf_dir: str,
+        book_title: str = "",
+    ) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Extrae el índice jerárquico del EPUB (EPUB 3 nav + EPUB 2 NCX) preservando
+        los ancestros (Partes / Libros) y normalizando URL encoding (%20, rutas relativas).
+        """
+        toc_by_href: Dict[str, Dict[str, Any]] = {}
+        ordered_entries: List[Dict[str, Any]] = []
+        namelist_set = set(zf.namelist())
+        norm_book_title = _strip_accents_lower(book_title)
+        wrapper_skip = {
+            "cover", "cubierta", "portada", "contents", "table of contents",
+            "indice", "sumario", "title page", "portadilla",
+        }
+        if norm_book_title:
+            wrapper_skip.add(norm_book_title)
+
+        def clean_ancestors(raw_ancs: List[str]) -> List[str]:
+            out: List[str] = []
+            for a in raw_ancs:
+                ca = _clean_heading_text(a)
+                na = _strip_accents_lower(ca)
+                if not ca or na in wrapper_skip:
+                    continue
+                if norm_book_title and len(norm_book_title) >= 4 and na == norm_book_title:
+                    continue
+                out.append(ca)
+            return out
+
+        def register_entry(norm_href: str, label: str, ancestors: List[str], depth: int) -> None:
+            clean_lbl = _clean_heading_text(label)
+            if not clean_lbl or not norm_href:
+                return
+            clean_ancs = clean_ancestors(ancestors)
+            entry = {
+                "label": clean_lbl,
+                "ancestors": clean_ancs,
+                "depth": len(clean_ancs),
+                "order": len(ordered_entries),
+                "href": norm_href,
+            }
+            ordered_entries.append(entry)
+            low_key = norm_href.lower()
+            existing = toc_by_href.get(norm_href) or toc_by_href.get(low_key)
+            if existing is None:
+                toc_by_href[norm_href] = entry
+                toc_by_href[low_key] = entry
+            elif not existing.get("ancestors") and clean_ancs:
+                # Enriquecer con jerarquía si la primera fuente (ej. nav plano) no la tenía
+                existing["ancestors"] = clean_ancs
+                existing["depth"] = len(clean_ancs)
+
+        def resolve_zip_member(raw_path: str) -> Optional[str]:
+            if raw_path in namelist_set:
+                return raw_path
+            unq = urllib.parse.unquote(raw_path)
+            if unq in namelist_set:
+                return unq
+            return None
+
+        # 1. EPUB 3 Nav Document (sólo <nav epub:type="toc"> / role="doc-toc", ignorando landmarks)
         for item in manifest.values():
             if "nav" in item.get("properties", "").split():
-                nav_href = item["href"]
-                if nav_href in zf.namelist():
-                    nav_dir = posixpath.dirname(nav_href)
-                    soup = BeautifulSoup(zf.read(nav_href), "html.parser")
-                    for a in soup.find_all("a", href=True):
-                        raw_target = a["href"].split("#")[0]
-                        if raw_target:
-                            target_path = posixpath.normpath(posixpath.join(nav_dir, raw_target))
-                            label = a.get_text(" ", strip=True)
-                            if label and target_path not in toc_map:
-                                toc_map[target_path] = label
+                nav_member = resolve_zip_member(item["href"])
+                if not nav_member:
+                    continue
+                nav_dir = posixpath.dirname(nav_member)
+                try:
+                    soup = BeautifulSoup(zf.read(nav_member), "html.parser")
+                except Exception:
+                    continue
+                navs = soup.find_all("nav")
+                toc_nav = None
+                for nv in navs:
+                    attrs_low = {str(k).lower(): str(v).lower() for k, v in nv.attrs.items()}
+                    etype = attrs_low.get("epub:type") or attrs_low.get("type") or ""
+                    role = attrs_low.get("role") or ""
+                    if "toc" in etype.split() or role == "doc-toc":
+                        toc_nav = nv
+                        break
+                if toc_nav is None:
+                    for nv in navs:
+                        attrs_low = {str(k).lower(): str(v).lower() for k, v in nv.attrs.items()}
+                        etype = attrs_low.get("epub:type") or attrs_low.get("type") or ""
+                        if not any(bad in etype for bad in ("landmarks", "page-list", "loi", "lot")):
+                            toc_nav = nv
+                            break
 
-        # 2. Intentar EPUB 2 NCX
+                if toc_nav is not None:
+                    def walk_ol(ol_tag: Tag, ancestors: List[str], depth: int) -> None:
+                        for li in ol_tag.find_all("li", recursive=False):
+                            direct_a = li.find("a", href=True, recursive=False)
+                            direct_span = li.find("span", recursive=False)
+                            label_el = direct_a or direct_span
+                            if label_el is None:
+                                # Algunos nav envuelven <a> dentro de un <div>/<p> antes del <ol>
+                                for ch in li.children:
+                                    if isinstance(ch, Tag) and ch.name not in ("ol", "ul"):
+                                        sub_a = ch.find("a", href=True) if ch.name != "a" else ch
+                                        if sub_a:
+                                            direct_a = sub_a
+                                            label_el = sub_a
+                                            break
+                                        if _extract_clean_element_text(ch):
+                                            label_el = ch
+                                            break
+                            lbl = _extract_clean_element_text(label_el) if label_el is not None else ""
+                            if direct_a and direct_a.get("href"):
+                                norm_target = _normalize_toc_href(nav_dir, str(direct_a["href"]))
+                                register_entry(norm_target, lbl, ancestors, depth)
+                            next_ancs = ancestors + ([lbl] if lbl else [])
+                            for sub_ol in li.find_all(["ol", "ul"], recursive=False):
+                                walk_ol(sub_ol, next_ancs, depth + 1)
+
+                    for top_ol in toc_nav.find_all(["ol", "ul"], recursive=False):
+                        walk_ol(top_ol, [], 0)
+
+        # 2. EPUB 2 NCX (<navMap> recursivo respetando sólo hijos directos <navPoint>)
         for item in manifest.values():
             if "ncx" in item.get("media_type", "").lower() or item["href"].lower().endswith(".ncx"):
-                ncx_href = item["href"]
-                if ncx_href in zf.namelist():
-                    ncx_dir = posixpath.dirname(ncx_href)
-                    try:
-                        ncx_root = ET.fromstring(zf.read(ncx_href))
-                        for nav_point in ncx_root.iter():
-                            if nav_point.tag.split("}")[-1].lower() == "navpoint":
-                                label = ""
-                                src = ""
-                                for child in nav_point.iter():
-                                    ctag = child.tag.split("}")[-1].lower()
-                                    if ctag == "text" and child.text and not label:
-                                        label = child.text.strip()
-                                    elif ctag == "content" and "src" in child.attrib and not src:
-                                        src = child.attrib["src"].split("#")[0]
-                                if label and src:
-                                    target_path = posixpath.normpath(posixpath.join(ncx_dir, src))
-                                    if target_path not in toc_map:
-                                        toc_map[target_path] = label
-                    except Exception:
-                        pass
+                ncx_member = resolve_zip_member(item["href"])
+                if not ncx_member:
+                    continue
+                ncx_dir = posixpath.dirname(ncx_member)
+                try:
+                    ncx_root = ET.fromstring(zf.read(ncx_member))
+                except Exception:
+                    continue
 
-        return toc_map
+                nav_map = None
+                for el in ncx_root.iter():
+                    if el.tag.split("}")[-1].lower() == "navmap":
+                        nav_map = el
+                        break
+                if nav_map is None:
+                    continue
+
+                def walk_navpoints(parent_el: ET.Element, ancestors: List[str], depth: int) -> None:
+                    for child in list(parent_el):
+                        if child.tag.split("}")[-1].lower() != "navpoint":
+                            continue
+                        label = ""
+                        src = ""
+                        for sub in list(child):
+                            stag = sub.tag.split("}")[-1].lower()
+                            if stag == "navlabel" and not label:
+                                for txt_el in list(sub):
+                                    if txt_el.tag.split("}")[-1].lower() == "text":
+                                        label = _clean_heading_text("".join(txt_el.itertext()))
+                                        if label:
+                                            break
+                            elif stag == "content" and "src" in sub.attrib and not src:
+                                src = sub.attrib["src"]
+                        if label and src:
+                            norm_target = _normalize_toc_href(ncx_dir, src)
+                            register_entry(norm_target, label, ancestors, depth)
+                        next_ancs = ancestors + ([label] if label else [])
+                        walk_navpoints(child, next_ancs, depth + 1)
+
+                walk_navpoints(nav_map, [], 0)
+
+        return toc_by_href, ordered_entries
+
+    def _extract_html_title_context(self, raw_html: str, norm_href: str) -> Dict[str, Any]:
+        """Extrae señales semánticas del HTML (epub:type, encabezados iniciales, bloques iniciales) sin modificar el texto."""
+        soup = BeautifulSoup(raw_html, "html.parser")
+        for tag in soup(["script", "style", "head", "meta", "link", "noscript"]):
+            tag.decompose()
+        body = soup.find("body") or soup
+
+        epub_types: set = set()
+
+        def collect_types(el: Optional[Tag]) -> None:
+            if not isinstance(el, Tag):
+                return
+            for k, v in el.attrs.items():
+                kl = str(k).lower()
+                if kl.endswith("type") or kl == "role":
+                    vals = v if isinstance(v, list) else str(v).split()
+                    for tok in vals:
+                        t = tok.strip().lower()
+                        if t:
+                            epub_types.add(t)
+
+        collect_types(body)
+        for ch in body.find_all(["section", "div", "article"], recursive=False):
+            collect_types(ch)
+
+        heading_tags = {"h1", "h2", "h3", "h4", "h5", "h6"}
+        block_tags = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "li", "dt", "dd"}
+
+        def has_nested_block(el: Tag) -> bool:
+            return any(c.name in block_tags for c in el.find_all(block_tags))
+
+        top_headings: List[str] = []
+        lead_blocks: List[Tuple[str, str]] = []
+        chars_before_heading = 0
+        first_text_parts: List[str] = []
+        first_text_len = 0
+
+        for el in body.find_all(list(block_tags) + ["div", "section", "article"]):
+            is_leaf_block = (el.name in block_tags and not has_nested_block(el)) or (
+                el.name in {"div", "section", "article"}
+                and not el.find(list(block_tags) + ["div", "section", "article"])
+            )
+            if not is_leaf_block:
+                continue
+            txt = _extract_clean_element_text(el)
+            if not txt:
+                continue
+            if len(lead_blocks) < 4:
+                lead_blocks.append((el.name, txt[:220]))
+            if first_text_len < 320:
+                first_text_parts.append(txt[:320])
+                first_text_len += len(txt) + 1
+            if el.name in heading_tags:
+                if chars_before_heading < 220 and len(top_headings) < 2 and len(txt) <= 110:
+                    top_headings.append(txt)
+            else:
+                chars_before_heading += len(txt)
+
+        return {
+            "href": norm_href,
+            "stem": Path(norm_href).stem.lower(),
+            "epub_types": sorted(epub_types),
+            "top_headings": top_headings,
+            "lead_blocks": lead_blocks,
+            "first_text": " ".join(first_text_parts)[:350],
+        }
+
+    @staticmethod
+    def _kw_in_norm(norm_text: str, keywords: Tuple[str, ...]) -> bool:
+        for kw in keywords:
+            if kw in {"notes", "notas", "nota", "cita", "citas", "copy"}:
+                if norm_text == kw or norm_text.startswith(f"{kw} ") or norm_text.endswith(f" {kw}"):
+                    return True
+            elif re.search(rf"(?<![a-z0-9]){re.escape(kw)}(?![a-z0-9])", norm_text):
+                return True
+        return False
+
+    def _classify_chapter_kind(
+        self,
+        label: str,
+        epub_types: List[str],
+        sentence_count: int,
+        position_ratio: float,
+        has_started_story: bool,
+        first_text: str,
+        book_title: str,
+    ) -> str:
+        norm = _strip_accents_lower(label)
+        etypes = set(epub_types or [])
+        norm_book = _strip_accents_lower(book_title)
+        norm_book_base = _strip_accents_lower(re.sub(r"\s*\([^)]*\)\s*$", "", str(book_title or "")))
+        first_low = _strip_accents_lower(first_text)
+
+        if etypes & {"prologue"} or re.match(r"^(?:prologue|prologo)\b", norm):
+            return "prologue"
+        if etypes & {"epilogue"} or re.match(r"^(?:epilogue|epilogo)\b", norm):
+            return "epilogue"
+        if re.search(r"\b(?:interlude|interludio)\b", norm):
+            return "interlude"
+        if etypes & {"part", "division"} and sentence_count <= 12:
+            return "divider"
+        if _DIVIDER_TITLE_RE.match(norm) and sentence_count <= 12:
+            return "divider"
+
+        if etypes & {"epigraph"} and sentence_count <= 12:
+            return "divider" if has_started_story else "front_matter"
+        if etypes & {"cover", "titlepage", "halftitlepage", "dedication", "toc", "frontmatter"}:
+            return "front_matter"
+        if etypes & {"copyright-page", "imprint", "colophon"}:
+            return "front_matter" if position_ratio < 0.5 else "back_matter"
+        if etypes & {"acknowledgments", "afterword", "bibliography", "glossary", "index", "notes", "endnotes", "rearnotes", "backmatter"}:
+            return "back_matter"
+
+        if norm in {"epigraph", "epigrafe", "cita", "citas"} or norm.startswith(("epigraph ", "epigrafe ")):
+            return "divider" if has_started_story else "front_matter"
+
+        if norm == "copy" and sentence_count <= 25:
+            return "front_matter" if position_ratio < 0.5 else "back_matter"
+
+        if sentence_count <= 15 and (
+            (norm_book and norm == norm_book)
+            or (norm_book_base and len(norm_book_base) >= 4 and norm == norm_book_base)
+        ):
+            return "front_matter"
+
+        if self._kw_in_norm(norm, _BACK_MATTER_TITLE_KW):
+            if position_ratio >= 0.65 or sentence_count <= 45 or any(
+                strong in norm
+                for strong in (
+                    "about the author", "sobre el autor", "about the publisher", "sobre la editorial",
+                    "acknowledgment", "acknowledgement", "agradecimiento", "praise", "other works", "also by",
+                    "mailing list", "patreon", "nota del autor", "author's note", "authors note",
+                    "bookperk", "proxima lectura", "facebook group", "material adicional",
+                )
+            ):
+                return "back_matter"
+
+        if self._kw_in_norm(norm, _FRONT_MATTER_TITLE_KW):
+            return "back_matter" if position_ratio >= 0.72 and has_started_story else "front_matter"
+
+        if sentence_count <= 20 and any(
+            promo in first_low
+            for promo in (
+                "gracias por adquirir", "thank you for purchasing", "planetadelibros",
+                "todos los derechos reservados", "all rights reserved",
+                "no se permite la reproduccion", "primera edicion", "first edition",
+            )
+        ):
+            return "front_matter" if position_ratio < 0.5 else "back_matter"
+
+        return "chapter"
+
+    def _resolve_book_chapter_titles(
+        self,
+        chapters: List[Dict[str, Any]],
+        title_contexts: List[Dict[str, Any]],
+        book_title: str,
+        book_lang: str,
+    ) -> None:
+        """
+        Asigna a cada capítulo un nombre canónico claro y coherente basado en el índice (TOC)
+        del libro, su jerarquía de Partes/Libros y señales semánticas del HTML, sin usar nunca
+        el índice interno de spine como falso 'Capítulo N'.
+        """
+        total = len(chapters)
+        if total == 0:
+            return
+
+        is_en = str(book_lang or "").lower().startswith("en")
+        norm_book = _strip_accents_lower(book_title)
+
+        def loc(en_txt: str, es_txt: str) -> str:
+            return en_txt if is_en else es_txt
+
+        def combine_top_headings(headings: List[str]) -> str:
+            if not headings:
+                return ""
+            h0 = _normalize_heading_casing(headings[0])
+            if len(headings) >= 2:
+                h1 = _normalize_heading_casing(headings[1])
+                if (
+                    h1
+                    and len(h1) <= 55
+                    and _strip_accents_lower(h1) != _strip_accents_lower(h0)
+                    and not h1.startswith(("“", "\"", "'", "«"))
+                    and not re.search(r"[.!?]$", h1)
+                ):
+                    if _DIVIDER_TITLE_RE.match(_strip_accents_lower(h0)) or re.match(
+                        r"^(?:chapter|capitulo|primer|segundo|tercer|cuarto|first|second|third|fourth|interlude|interludio)\b",
+                        _strip_accents_lower(h0),
+                    ):
+                        return f"{h0}: {h1}"
+            return h0
+
+        def detect_semantic_non_toc_title(
+            ctx: Dict[str, Any],
+            sentence_count: int,
+            pos_ratio: float,
+            prev_kind: str,
+            active_part: str,
+        ) -> Tuple[str, str]:
+            """Devuelve (titulo, kind_hint) si el archivo sin TOC es claramente front/back/epígrafe."""
+            etypes = set(ctx.get("epub_types") or [])
+            stem = ctx.get("stem") or ""
+            first_low = _strip_accents_lower(ctx.get("first_text") or "")
+
+            # 1. epub:type explícito
+            if "dedication" in etypes:
+                return loc("Dedication", "Dedicatoria"), "front_matter"
+            if "epigraph" in etypes:
+                return loc("Epigraph", "Epígrafe"), ("divider" if pos_ratio > 0.12 and active_part else "front_matter")
+            if etypes & {"copyright-page", "imprint", "colophon"}:
+                return loc("Copyright", "Créditos"), ("front_matter" if pos_ratio < 0.5 else "back_matter")
+            if etypes & {"titlepage", "halftitlepage"}:
+                return loc("Title Page", "Portadilla"), "front_matter"
+            if "toc" in etypes:
+                return loc("Table of Contents", "Índice"), "front_matter"
+            if "acknowledgments" in etypes:
+                return loc("Acknowledgments", "Agradecimientos"), "back_matter"
+
+            # 2. Epígrafe / cita justo después de una portadilla de Parte (ej. The Exorcist Part002a.html)
+            if prev_kind == "divider" and active_part and sentence_count <= 10:
+                return loc("Epigraph", "Epígrafe"), "divider"
+
+            # 3. Nombre de archivo semántico
+            if re.search(r"(?:sinopsis|synopsis|blurb)", stem):
+                return loc("Synopsis", "Sinopsis"), "front_matter"
+            if re.search(r"(?:^ded(?:ic|_|-|\d|$)|dedicat)", stem):
+                return loc("Dedication", "Dedicatoria"), "front_matter"
+            if re.search(r"(?:epigraph|epigrafe|cita|quote|motto)", stem):
+                return loc("Epigraph", "Epígrafe"), ("divider" if active_part else "front_matter")
+            if re.match(r"^intro\d*$", stem):
+                if sentence_count <= 16:
+                    return loc("Epigraph", "Epígrafe"), "front_matter"
+                return loc("Introduction", "Introducción"), "front_matter"
+            if re.search(r"(?:copyright|credit|colofon|colophon|legal|imprint)", stem):
+                return loc("Copyright", "Créditos"), ("front_matter" if pos_ratio < 0.5 else "back_matter")
+            if re.search(r"(?:title|titulo|portada|cubierta|cover)", stem) and sentence_count <= 15:
+                return loc("Title Page", "Portadilla"), "front_matter"
+            if re.search(r"(?:^toc$|indice|contents)", stem):
+                return loc("Table of Contents", "Índice"), "front_matter"
+            if re.search(r"(?:acknowl|agradec)", stem):
+                return loc("Acknowledgments", "Agradecimientos"), "back_matter"
+            if re.search(r"(?:about.*author|sobre.*autor|bio)", stem):
+                return loc("About the Author", "Sobre el Autor"), "back_matter"
+
+            # 4. Texto editorial / legal (ej. Planetadelibros, copyright, ISBN)
+            if sentence_count <= 20 and any(
+                kw in first_low
+                for kw in (
+                    "gracias por adquirir", "thank you for purchasing", "planetadelibros",
+                    "todos los derechos reservados", "all rights reserved",
+                    "no se permite la reproduccion", "isbn", "primera edicion", "first edition",
+                    "titulo original", "first published",
+                )
+            ):
+                if any(k in first_low for k in ("isbn", "todos los derechos", "all rights reserved", "copyright", "primera edicion")):
+                    return loc("Copyright", "Créditos"), ("front_matter" if pos_ratio < 0.5 else "back_matter")
+                return loc("Publisher Info", "Información Editorial"), ("front_matter" if pos_ratio < 0.5 else "back_matter")
+
+            return "", ""
+
+        resolved: List[Dict[str, Any]] = []
+        active_part = ""
+        has_started_story = False
+        fallback_chapter_num = 0
+
+        for idx, (ch, ctx) in enumerate(zip(chapters, title_contexts)):
+            sc = int(ch.get("sentence_count", 0))
+            pos_ratio = idx / max(1, total - 1)
+            toc_entry = ctx.get("toc_entry")
+            inherited_part = ctx.get("inherited_skipped_part") or ""
+            top_headings = ctx.get("top_headings") or []
+            lead_blocks = ctx.get("lead_blocks") or []
+            prev_item = resolved[-1] if resolved else None
+            prev_kind = prev_item["kind"] if prev_item else ""
+
+            if inherited_part:
+                active_part = inherited_part
+
+            base_title = ""
+            part_title = ""
+            in_toc = False
+            kind_hint = ""
+
+            # Prioridad 1: Entrada directa en el índice (TOC) del EPUB
+            if toc_entry:
+                in_toc = True
+                raw_toc = toc_entry["label"]
+                ancestors = toc_entry.get("ancestors") or []
+                clean_toc = _normalize_heading_casing(raw_toc)
+
+                # Caso Calibre "(texto)": ej. "LAS ZARZAS (texto)" que encabeza una Parte y contiene el primer capítulo ("UNO")
+                m_texto = re.match(r"^(.+?)\s*\(texto\)\s*$", raw_toc, re.I)
+                if m_texto:
+                    section_name = _normalize_heading_casing(m_texto.group(1))
+                    if inherited_part and _strip_accents_lower(inherited_part) != _strip_accents_lower(section_name):
+                        active_part = f"{inherited_part}: {section_name}"
+                    else:
+                        active_part = section_name
+                    next_is_non_toc_sibling = (
+                        idx + 1 < total and title_contexts[idx + 1].get("toc_entry") is None
+                    )
+                    lead_txt = lead_blocks[0][1] if lead_blocks else ""
+                    if next_is_non_toc_sibling and lead_txt and _is_standalone_chapter_lead(lead_txt):
+                        base_title = _normalize_heading_casing(lead_txt)
+                        part_title = active_part
+                    else:
+                        base_title = section_name
+                        part_title = inherited_part if inherited_part and _strip_accents_lower(inherited_part) != _strip_accents_lower(section_name) else ""
+                else:
+                    if ancestors:
+                        active_part = _normalize_heading_casing(ancestors[-1])
+                        part_title = active_part
+                    else:
+                        if _DIVIDER_TITLE_RE.match(_strip_accents_lower(clean_toc)) and sc <= 12:
+                            active_part = clean_toc
+                            part_title = ""
+                        elif re.match(r"^(?:epilogue|epilogo)\b", _strip_accents_lower(clean_toc)):
+                            active_part = ""
+                            part_title = ""
+                        else:
+                            # Entrada de primer nivel que no es parte ni subcapítulo: limpia active_part
+                            active_part = ""
+                            part_title = ""
+
+                    # Evitar que la portadilla tenga literalmente el título del libro como si fuera capítulo
+                    norm_book_base = _strip_accents_lower(re.sub(r"\s*\([^)]*\)\s*$", "", str(book_title or "")))
+                    if sc <= 15 and pos_ratio < 0.25 and (
+                        (norm_book and _strip_accents_lower(clean_toc) == norm_book)
+                        or (norm_book_base and len(norm_book_base) >= 4 and _strip_accents_lower(clean_toc) == norm_book_base)
+                    ):
+                        base_title = loc("Title Page", "Portadilla")
+                        kind_hint = "front_matter"
+                    else:
+                        base_title = clean_toc
+
+            # Prioridad 2: Continuación de una portadilla corta de TOC (ej. Epílogo 1 frase + 409 frases, o Material adicional 2 frases + 514 frases)
+            if (
+                not base_title
+                and prev_item is not None
+                and prev_item["in_toc"]
+                and prev_item["sentence_count"] <= 3
+                and prev_item["kind"] in {"prologue", "epilogue", "interlude", "chapter", "back_matter"}
+                and not _DIVIDER_TITLE_RE.match(_strip_accents_lower(prev_item["base_title"]))
+                and sc >= 15
+            ):
+                candidate_h = combine_top_headings(top_headings)
+                if not candidate_h or _strip_accents_lower(candidate_h) == _strip_accents_lower(prev_item["base_title"]):
+                    base_title = prev_item["base_title"]
+                    part_title = prev_item["part_title"]
+                    kind_hint = prev_item["kind"]
+                    in_toc = True
+                    prev_item["base_title"] = f"{prev_item['base_title']} ({loc('Title Page', 'portadilla')})"
+                    prev_item["kind"] = "divider"
+
+            # Prioridad 3: Encabezado HTML h1-h6 al inicio del archivo (antes de la prosa)
+            if not base_title and top_headings:
+                cand = combine_top_headings(top_headings)
+                if cand:
+                    if norm_book and _strip_accents_lower(cand) == norm_book and sc <= 15 and pos_ratio < 0.25:
+                        base_title = loc("Title Page", "Portadilla")
+                        kind_hint = "front_matter"
+                    else:
+                        base_title = cand
+                        if active_part and not _DIVIDER_TITLE_RE.match(_strip_accents_lower(cand)):
+                            part_title = active_part
+
+            # Prioridad 4: Encabezado de capítulo en <p> al principio del archivo (ej. REY DOLOR: UNO, 15:55 (EST), 1, PRIMER INTERLUDIO, Dragonora en punto)
+            if not base_title and lead_blocks:
+                b0_txt = lead_blocks[0][1]
+                is_short_title_lead = (
+                    sc >= 15
+                    and len(lead_blocks) >= 2
+                    and 2 <= len(b0_txt) <= 36
+                    and 1 <= len(b0_txt.split()) <= 5
+                    and not re.search(r"[.!?…,:;]$", b0_txt)
+                    and not b0_txt.startswith(("—", "–", "-", "\"", "“", "«", "'"))
+                    and (len(lead_blocks[1][1]) >= 40 or re.search(r"[.!?…]$", lead_blocks[1][1]))
+                    and bool(active_part)
+                )
+                if _is_standalone_chapter_lead(b0_txt) or is_short_title_lead:
+                    h0 = _normalize_heading_casing(b0_txt)
+                    # Combinar 2ª línea si es subtítulo de interludio/parte/capítulo (ej. PRIMER INTERLUDIO + GWEN, PISOTEADA)
+                    if len(lead_blocks) >= 2:
+                        b1_txt = lead_blocks[1][1]
+                        if (
+                            re.match(r"^(?:primer|segundo|tercer|cuarto|first|second|third|fourth|interlude|interludio|part|parte|book|libro)\b", _strip_accents_lower(h0))
+                            and len(b1_txt) <= 48
+                            and not re.search(r"[.!?]$", b1_txt)
+                            and len(b1_txt.split()) <= 6
+                        ):
+                            h1 = _normalize_heading_casing(b1_txt)
+                            if h1 and _strip_accents_lower(h1) != _strip_accents_lower(h0):
+                                h0 = f"{h0}: {h1}"
+                    base_title = h0
+                    if _DIVIDER_TITLE_RE.match(_strip_accents_lower(base_title)) and sc <= 12:
+                        active_part = base_title
+                        part_title = ""
+                    elif active_part:
+                        part_title = active_part
+
+            # Prioridad 5: Detección semántica de front/back matter y epígrafes sin TOC
+            if not base_title:
+                sem_title, sem_kind = detect_semantic_non_toc_title(
+                    ctx=ctx,
+                    sentence_count=sc,
+                    pos_ratio=pos_ratio,
+                    prev_kind=prev_kind,
+                    active_part=active_part,
+                )
+                if sem_title:
+                    base_title = sem_title
+                    kind_hint = sem_kind
+                    if sem_kind == "divider" and active_part:
+                        part_title = active_part
+
+            # Prioridad 6: Fallback limpio sin inventar spine index como 'Capítulo N'
+            if not base_title:
+                if not has_started_story and sc <= 15:
+                    base_title = loc("Front Matter", "Preliminar")
+                    kind_hint = "front_matter"
+                elif has_started_story and prev_kind == "back_matter" and sc <= 20:
+                    base_title = loc("Back Matter", "Anexo")
+                    kind_hint = "back_matter"
+                elif has_started_story and pos_ratio > 0.85 and prev_kind in {"back_matter", "epilogue"} and sc >= 30:
+                    # Relato extra / continuación al final del libro (ej. anexo narrativo sin título en TOC)
+                    base_title = loc("Bonus Chapter", "Anexo Narrativo")
+                    kind_hint = "back_matter"
+                else:
+                    fallback_chapter_num += 1
+                    base_title = f"{loc('Chapter', 'Capítulo')} {fallback_chapter_num}"
+                    kind_hint = "chapter"
+                    if active_part:
+                        part_title = active_part
+
+            # Quitar punto final suelto en números puros ("1." -> "1", "27." -> "27")
+            if re.match(r"^\d{1,3}\.$", base_title):
+                base_title = base_title[:-1]
+
+            kind = kind_hint or self._classify_chapter_kind(
+                label=base_title,
+                epub_types=ctx.get("epub_types") or [],
+                sentence_count=sc,
+                position_ratio=pos_ratio,
+                has_started_story=has_started_story,
+                first_text=ctx.get("first_text") or "",
+                book_title=book_title,
+            )
+
+            # Si el capítulo pertenece a "Epilogue" / "Epílogo" como parte padre (ej. King Sorrow Epilogue · 1..12)
+            if part_title and re.match(r"^(?:epilogue|epilogo)\b", _strip_accents_lower(part_title)) and kind == "chapter":
+                kind = "epilogue"
+
+            if kind in {"prologue", "chapter", "interlude", "epilogue"}:
+                has_started_story = True
+            if kind == "back_matter":
+                active_part = ""
+
+            resolved.append(
+                {
+                    "base_title": base_title,
+                    "part_title": part_title,
+                    "in_toc": in_toc,
+                    "kind": kind,
+                    "sentence_count": sc,
+                    "top_headings": top_headings,
+                }
+            )
+
+        # Post-paso 1: Reparar erratas consecutivas del NCX donde el editor repitió el mismo número (ej. dos "Capítulo 75")
+        def _extract_bare_num(txt: str) -> str:
+            m = re.search(r"\b(\d{1,3})\b", _strip_accents_lower(txt))
+            return m.group(1) if m else ""
+
+        for i in range(1, total):
+            cur = resolved[i]
+            prv = resolved[i - 1]
+            if (
+                cur["kind"] == "chapter"
+                and prv["kind"] == "chapter"
+                and _strip_accents_lower(cur["base_title"]) == _strip_accents_lower(prv["base_title"])
+                and _strip_accents_lower(cur["part_title"]) == _strip_accents_lower(prv["part_title"])
+            ):
+                base_num = _extract_bare_num(cur["base_title"])
+                if cur["top_headings"]:
+                    alt_cur = _normalize_heading_casing(cur["top_headings"][0])
+                    alt_num = _extract_bare_num(alt_cur)
+                    if alt_cur and _strip_accents_lower(alt_cur) != _strip_accents_lower(cur["base_title"]) and (not base_num or alt_num != base_num):
+                        cur["base_title"] = alt_cur
+                        continue
+                if prv["top_headings"]:
+                    alt_prv = _normalize_heading_casing(prv["top_headings"][0])
+                    alt_num = _extract_bare_num(alt_prv)
+                    if alt_prv and _strip_accents_lower(alt_prv) != _strip_accents_lower(prv["base_title"]) and (not base_num or alt_num != base_num):
+                        prv["base_title"] = alt_prv
+
+        # Post-paso 2: Detectar qué partes necesitan prefijo para desambiguar títulos repetidos entre partes
+        # (ej. Part I..IV -> Chapter One; Book Three..Epilogue -> 1..12)
+        base_to_parts: Dict[str, set] = {}
+        base_global_counts: Dict[str, int] = {}
+        for item in resolved:
+            bn = _strip_accents_lower(item["base_title"])
+            base_global_counts[bn] = base_global_counts.get(bn, 0) + 1
+            pt = item["part_title"]
+            if not pt:
+                continue
+            base_to_parts.setdefault(bn, set()).add(_strip_accents_lower(pt))
+
+        parts_needing_prefix: set = set()
+        for bn, part_set in base_to_parts.items():
+            if len(part_set) > 1:
+                parts_needing_prefix.update(part_set)
+
+        # También prefijar epígrafes internos de cada Parte (ej. Part II · Epigraph)
+        for item in resolved:
+            pt = item["part_title"]
+            if not pt:
+                continue
+            pt_norm = _strip_accents_lower(pt)
+            if item["kind"] == "divider" and _strip_accents_lower(item["base_title"]) in {"epigraph", "epigrafe"}:
+                parts_needing_prefix.add(pt_norm)
+
+        # Construir título canónico + toc_title
+        for item in resolved:
+            base = item["base_title"]
+            pt = item["part_title"]
+            item["toc_title"] = base
+            # Los interludios ya nombrados (ej. "Third Interlude: ...") son únicos por sí mismos
+            is_unique_interlude = (
+                item["kind"] == "interlude" and base_global_counts.get(_strip_accents_lower(base), 0) == 1
+            )
+            if pt and _strip_accents_lower(pt) in parts_needing_prefix and not is_unique_interlude:
+                short_pt = _shorten_part_prefix(pt)
+                if short_pt and not _strip_accents_lower(base).startswith(_strip_accents_lower(short_pt)):
+                    item["canonical_title"] = f"{short_pt} · {base}"
+                else:
+                    item["canonical_title"] = base
+            else:
+                item["canonical_title"] = base
+
+        # Post-paso 3: Desambiguar cualquier duplicado restante (ej. Epigraph x2, Epígrafe x3)
+        title_counts: Dict[str, int] = {}
+        for item in resolved:
+            tk = _strip_accents_lower(item["canonical_title"])
+            title_counts[tk] = title_counts.get(tk, 0) + 1
+
+        seen_counts: Dict[str, int] = {}
+        for item in resolved:
+            tk = _strip_accents_lower(item["canonical_title"])
+            if title_counts.get(tk, 0) > 1:
+                seen_counts[tk] = seen_counts.get(tk, 0) + 1
+                num = seen_counts[tk]
+                if item["kind"] in {"front_matter", "back_matter", "divider"}:
+                    item["canonical_title"] = f"{item['canonical_title']} {num}"
+                    item["toc_title"] = f"{item['toc_title']} {num}"
+                elif num > 1:
+                    item["canonical_title"] = f"{item['canonical_title']} ({num})"
+                    item["toc_title"] = f"{item['toc_title']} ({num})"
+
+        # Escribir campos finales sobre cada capítulo sin alterar index / sentences / html
+        for ch, item in zip(chapters, resolved):
+            ch["title"] = item["canonical_title"]
+            ch["toc_title"] = item["toc_title"]
+            ch["part_title"] = item["part_title"]
+            ch["in_toc"] = bool(item["in_toc"])
+            ch["kind"] = item["kind"]
 
     def _extract_images(
         self,
@@ -780,12 +1732,12 @@ class EpubParser:
                 else:
                     img["src"] = img_src
 
-        # Detectar título del capítulo
-        detected_title = fallback_title
+        # Detectar título provisional del capítulo (luego refinado por _resolve_book_chapter_titles)
+        detected_title = _clean_heading_text(fallback_title) if fallback_title else ""
         if not detected_title:
             heading = body.find(["h1", "h2", "h3"])
             if heading:
-                detected_title = heading.get_text(" ", strip=True)
+                detected_title = _extract_clean_element_text(heading)
         if not detected_title or len(detected_title) > 120:
             detected_title = f"Capítulo {chapter_index + 1}"
 
@@ -1056,6 +2008,168 @@ class EpubParser:
         if en_score > es_score * 1.3:
             return metadata_lang if metadata_lang.startswith("en") else "en-US"
         return metadata_lang
+
+    def refresh_book_chapter_titles_from_epub(self, book_id: str) -> Dict[str, Any]:
+        """
+        Recalcula los títulos canónicos de capítulos (title, toc_title, part_title, in_toc, kind)
+        leyendo el book.epub original, SIN alterar índices (0..N-1), sentence_count, sentences,
+        html, audios cacheados ni progreso de lectura.
+        """
+        book_folder = self.books_dir / book_id
+        epub_path = book_folder / "book.epub"
+        chapters_path = book_folder / "chapters.json"
+        meta_path = book_folder / "metadata.json"
+        if not epub_path.exists() or not chapters_path.exists():
+            return {"ok": False, "changed": False, "reason": "missing_files"}
+
+        existing_chapters = json.loads(chapters_path.read_text(encoding="utf-8"))
+        existing_meta: Dict[str, Any] = {}
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_meta = {}
+
+        with zipfile.ZipFile(epub_path, "r") as zf:
+            opf_path = self._find_opf_path(zf)
+            opf_dir = posixpath.dirname(opf_path)
+            opf_root = ET.fromstring(zf.read(opf_path))
+
+            opf_meta = self._extract_metadata(opf_root, existing_meta.get("filename") or epub_path.name)
+            book_title = existing_meta.get("title") or opf_meta["title"]
+            book_lang = existing_meta.get("language") or opf_meta["language"]
+            manifest, id_to_href = self._extract_manifest(opf_root, opf_dir)
+            spine_hrefs = self._extract_spine(opf_root, id_to_href)
+            toc_entries, _ = self._extract_toc_entries(
+                zf, opf_root, manifest, opf_dir, book_title=book_title
+            )
+            smil_by_xhtml = self._extract_smil_overlays(zf, manifest)
+
+            namelist_set = set(zf.namelist())
+            reparsed_stubs: List[Dict[str, Any]] = []
+            title_contexts: List[Dict[str, Any]] = []
+            pending_skipped_part = ""
+
+            for href in spine_hrefs:
+                resolved_href = href
+                if resolved_href not in namelist_set:
+                    decoded_href = urllib.parse.unquote(resolved_href)
+                    if decoded_href in namelist_set:
+                        resolved_href = decoded_href
+                    else:
+                        continue
+
+                norm_href = _normalize_toc_href("", resolved_href)
+                toc_entry = (
+                    toc_entries.get(norm_href)
+                    or toc_entries.get(norm_href.lower())
+                    or toc_entries.get(_normalize_toc_href("", href))
+                    or toc_entries.get(_normalize_toc_href("", href).lower())
+                )
+                raw_html = zf.read(resolved_href).decode("utf-8", errors="replace")
+                chapter_dir = posixpath.dirname(resolved_href)
+                chapter_smil_pars = (
+                    smil_by_xhtml.get(resolved_href)
+                    or smil_by_xhtml.get(urllib.parse.unquote(resolved_href))
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(resolved_href)}")
+                    or smil_by_xhtml.get(f"__basename__:{posixpath.basename(urllib.parse.unquote(resolved_href))}")
+                    or []
+                )
+                title_ctx = self._extract_html_title_context(raw_html, norm_href)
+                parsed_ch = self._parse_chapter_html(
+                    raw_html=raw_html,
+                    chapter_index=len(reparsed_stubs),
+                    chapter_dir=chapter_dir,
+                    book_id=book_id,
+                    fallback_title=toc_entry["label"] if toc_entry else None,
+                    smil_pars=chapter_smil_pars,
+                )
+                if parsed_ch["sentence_count"] == 0:
+                    if toc_entry and _DIVIDER_TITLE_RE.match(_strip_accents_lower(toc_entry["label"])):
+                        pending_skipped_part = _normalize_heading_casing(toc_entry["label"])
+                    continue
+
+                title_ctx["toc_entry"] = toc_entry
+                title_ctx["inherited_skipped_part"] = pending_skipped_part
+                pending_skipped_part = ""
+                title_contexts.append(title_ctx)
+                reparsed_stubs.append(
+                    {
+                        "index": len(reparsed_stubs),
+                        "title": parsed_ch["title"],
+                        "sentence_count": parsed_ch["sentence_count"],
+                    }
+                )
+
+        if len(reparsed_stubs) != len(existing_chapters):
+            logger.warning(
+                "refresh_book_chapter_titles_from_epub(%s): chapter count mismatch (%s vs %s), aborting safe update",
+                book_id,
+                len(reparsed_stubs),
+                len(existing_chapters),
+            )
+            return {
+                "ok": False,
+                "changed": False,
+                "reason": f"chapter_count_mismatch:{len(reparsed_stubs)}!={len(existing_chapters)}",
+            }
+
+        self._resolve_book_chapter_titles(
+            chapters=reparsed_stubs,
+            title_contexts=title_contexts,
+            book_title=book_title,
+            book_lang=book_lang,
+        )
+
+        changed = False
+        for old_ch, new_ch in zip(existing_chapters, reparsed_stubs):
+            for field in ("title", "toc_title", "part_title", "in_toc", "kind"):
+                if old_ch.get(field) != new_ch.get(field):
+                    old_ch[field] = new_ch.get(field)
+                    changed = True
+
+        story_indices = [
+            int(ch["index"])
+            for ch in existing_chapters
+            if ch.get("kind") in {"prologue", "chapter", "interlude", "epilogue"}
+        ]
+        story_chapter_count = len(story_indices) or len(existing_chapters)
+
+        chapters_meta = [
+            {
+                "index": int(ch["index"]),
+                "title": ch["title"],
+                "toc_title": ch.get("toc_title") or ch["title"],
+                "part_title": ch.get("part_title") or "",
+                "in_toc": bool(ch.get("in_toc", False)),
+                "kind": ch.get("kind") or "chapter",
+                "sentence_count": int(ch.get("sentence_count", 0)),
+            }
+            for ch in existing_chapters
+        ]
+
+        if changed or existing_meta.get("story_chapter_count") != story_chapter_count or existing_meta.get("chapters") != chapters_meta:
+            chapters_path.write_text(
+                json.dumps(existing_chapters, ensure_ascii=False), encoding="utf-8"
+            )
+            if existing_meta:
+                existing_meta["story_chapter_count"] = story_chapter_count
+                existing_meta["chapters"] = chapters_meta
+                existing_meta["chapters_summary"] = [dict(cm) for cm in chapters_meta]
+                meta_path.write_text(
+                    json.dumps(existing_meta, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            changed = True
+
+        return {
+            "ok": True,
+            "changed": changed,
+            "book_id": book_id,
+            "chapter_count": len(existing_chapters),
+            "story_chapter_count": story_chapter_count,
+            "chapters_meta": chapters_meta,
+            "story_indices": story_indices,
+        }
 
     def refresh_book_images_from_epub(self, book_id: str) -> Dict[str, Any]:
         """

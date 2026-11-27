@@ -649,6 +649,43 @@ body.reader-open #brand-logo {
   font-weight: 600;
 }
 
+.toc-item.toc-divider {
+  margin-top: 10px;
+  padding: 7px 12px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border-top: 1px solid var(--border-color);
+  border-radius: 6px;
+}
+
+.toc-item.toc-divider.active {
+  color: #fff;
+}
+
+.toc-part-header {
+  margin-top: 10px;
+  padding: 6px 12px 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border-top: 1px solid var(--border-color);
+  user-select: none;
+}
+
+.toc-item.toc-child {
+  padding-left: 24px;
+}
+
+.toc-item.toc-meta-section:not(.active) {
+  opacity: 0.68;
+  font-size: 0.84rem;
+}
+
 .reader-main {
   flex: 1;
   max-width: var(--reader-max-width);

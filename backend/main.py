@@ -11,7 +11,7 @@ import time
 import unicodedata
 import zipfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,7 +62,7 @@ study_store = BookStudyStore(data_dir=DATA_DIR, books_dir=BOOKS_DIR)
 app = FastAPI(
     title="VozLectura — EPUB Reader & Offline Neural Audiobooks",
     description="Servidor local de lectura de EPUB con resaltado sincronizado y síntesis de voz neuronal offline (Piper & Kokoro 82M) en español e inglés.",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 app.add_middleware(
@@ -91,7 +91,7 @@ async def allow_private_network_cors(request: Request, call_next):
     return response
 
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 
 def _detect_local_lan_ip() -> str:
@@ -555,6 +555,20 @@ async def seed_demo_books_if_empty() -> None:
             logger.warning("Error actualizando imágenes de libros existentes: %s", exc)
 
     asyncio.create_task(_refresh_existing_books_images())
+
+    async def _refresh_existing_books_titles() -> None:
+        try:
+            lib = load_library()
+            target_ids = [bid for bid, bm in lib.items() if not bm.get("_chapter_titles_v3")]
+            if not target_ids:
+                return
+            changed = await asyncio.to_thread(_refresh_books_titles_batch, target_ids, False)
+            if changed:
+                logger.info("Títulos canónicos de capítulos actualizados para %d libro(s).", len(changed))
+        except Exception as exc:
+            logger.warning("Error actualizando títulos de capítulos de libros existentes: %s", exc)
+
+    asyncio.create_task(_refresh_existing_books_titles())
     await asyncio.to_thread(audio_store.resume_interrupted_jobs)
 
 
@@ -844,6 +858,127 @@ def _enrich_archived_books_with_study(active_ids: set) -> List[Dict[str, Any]]:
         reverse=True,
     )
     return out
+
+
+def _refresh_books_titles_batch(book_ids: List[str], recompute_pairings: bool = True) -> List[Dict[str, Any]]:
+    """
+    Recalcula títulos canónicos de capítulos desde book.epub para los libros indicados,
+    propaga cambios a library.json y study_store (Obsidian + sesiones + notas),
+    y recomputa chapter_map en libros emparejados.
+    """
+    library = load_library()
+    results: List[Dict[str, Any]] = []
+    dirty_lib = False
+    paired_pairs_done = set()
+
+    for bid in book_ids:
+        if bid not in library:
+            continue
+        res = epub_parser.refresh_book_chapter_titles_from_epub(bid)
+        if not res.get("ok"):
+            results.append({"book_id": bid, "ok": False, "reason": res.get("reason", "error")})
+            continue
+        chapters_meta = res.get("chapters_meta") or []
+        story_indices = res.get("story_indices") or []
+        story_count = int(res.get("story_chapter_count") or len(chapters_meta))
+
+        bmeta = library[bid]
+        bmeta["chapters"] = chapters_meta
+        bmeta["chapters_summary"] = [dict(cm) for cm in chapters_meta]
+        bmeta["story_chapter_count"] = story_count
+        bmeta["_chapter_titles_v3"] = True
+        dirty_lib = True
+        save_library(library)
+
+        mpath = BOOKS_DIR / bid / "metadata.json"
+        if mpath.exists():
+            try:
+                m = json.loads(mpath.read_text(encoding="utf-8"))
+                m["chapters"] = chapters_meta
+                m["chapters_summary"] = [dict(cm) for cm in chapters_meta]
+                m["story_chapter_count"] = story_count
+                m["_chapter_titles_v3"] = True
+                mpath.write_text(json.dumps(m, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+
+        study_res = study_store.refresh_book_chapter_titles(bid, chapters_meta, story_indices)
+
+        results.append(
+            {
+                "book_id": bid,
+                "title": bmeta.get("title", bid),
+                "ok": True,
+                "changed": bool(res.get("changed")),
+                "chapter_count": len(chapters_meta),
+                "story_chapter_count": story_count,
+                "study_updated": bool(study_res.get("updated")),
+            }
+        )
+
+    if dirty_lib:
+        save_library(library)
+
+    # Recomputar chapter_map de emparejamientos bilingües usando los nuevos títulos canónicos
+    if recompute_pairings and dirty_lib:
+        library = load_library()
+        pair_dirty = False
+        for bid in book_ids:
+            bmeta = library.get(bid)
+            if not isinstance(bmeta, dict):
+                continue
+            p_obj = bmeta.get("pairing")
+            if not isinstance(p_obj, dict) or not p_obj.get("paired_book_id"):
+                continue
+            partner_id = str(p_obj["paired_book_id"])
+            if partner_id not in library:
+                continue
+            pair_key = tuple(sorted((bid, partner_id)))
+            if pair_key in paired_pairs_done:
+                continue
+            paired_pairs_done.add(pair_key)
+            try:
+                align = _compute_bilingual_chapter_alignment(bid, partner_id, library)
+                if align.get("chapter_map"):
+                    p_obj["chapter_map"] = align["chapter_map"]
+                    p_obj["chapter_offset"] = int(align.get("dominant_offset") or 0)
+                    partner_p = library[partner_id].get("pairing")
+                    if isinstance(partner_p, dict) and partner_p.get("paired_book_id") == bid:
+                        partner_p["chapter_map"] = align.get("reverse_chapter_map") or {}
+                        partner_p["chapter_offset"] = -int(align.get("dominant_offset") or 0)
+                    for p_bid in (bid, partner_id):
+                        pmp = BOOKS_DIR / p_bid / "metadata.json"
+                        if pmp.exists():
+                            try:
+                                pm = json.loads(pmp.read_text(encoding="utf-8"))
+                                pm["pairing"] = library[p_bid]["pairing"]
+                                pmp.write_text(json.dumps(pm, ensure_ascii=False, indent=2), encoding="utf-8")
+                            except Exception:
+                                pass
+                    pair_dirty = True
+            except Exception as exc:
+                logger.warning("No se pudo recalcular emparejamiento %s <-> %s: %s", bid, partner_id, exc)
+        if pair_dirty:
+            save_library(library)
+
+    return results
+
+
+@app.post("/api/books/refresh-all-titles")
+async def refresh_all_book_titles_endpoint() -> Dict[str, Any]:
+    library = load_library()
+    all_ids = list(library.keys())
+    results = await asyncio.to_thread(_refresh_books_titles_batch, all_ids, True)
+    return {"ok": True, "count": len(results), "results": results}
+
+
+@app.post("/api/books/{book_id}/refresh-titles")
+async def refresh_book_titles_endpoint(book_id: str) -> Dict[str, Any]:
+    library = load_library()
+    if book_id not in library:
+        raise HTTPException(status_code=404, detail="Libro no encontrado")
+    results = await asyncio.to_thread(_refresh_books_titles_batch, [book_id], True)
+    return {"ok": True, "result": results[0] if results else {"book_id": book_id, "ok": False}}
 
 
 @app.get("/api/books")
@@ -1161,9 +1296,85 @@ def _strip_accents_lower(text: str) -> str:
     return norm.lower().strip()
 
 
+_WORD_NUM_MAP = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19, "twenty": 20,
+    "thirty": 30, "forty": 40, "fifty": 50,
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5, "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+    "uno": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6, "siete": 7, "ocho": 8, "nueve": 9, "diez": 10,
+    "once": 11, "doce": 12, "trece": 13, "catorce": 14, "quince": 15, "dieciseis": 16, "diecisiete": 17, "dieciocho": 18, "diecinueve": 19, "veinte": 20,
+    "veintiuno": 21, "veintidos": 22, "veintitres": 23, "veinticuatro": 24, "veinticinco": 25, "veintiseis": 26, "veintisiete": 27, "veintiocho": 28, "veintinueve": 29,
+    "treinta": 30, "cuarenta": 40, "cincuenta": 50,
+    "primero": 1, "primera": 1, "segundo": 2, "segunda": 2, "tercero": 3, "tercera": 3, "cuarto": 4, "cuarta": 4,
+    "quinto": 5, "quinta": 5, "sexto": 6, "sexta": 6, "septimo": 7, "septima": 7, "octavo": 8, "octava": 8, "noveno": 9, "novena": 9, "decimo": 10, "decima": 10,
+}
+
+
+def _parse_number_token(raw_str: str) -> Optional[int]:
+    s = _strip_accents_lower(raw_str).strip(" .:-")
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    if s in _ROMAN_MAP:
+        return _ROMAN_MAP[s]
+    if s in _WORD_NUM_MAP:
+        return _WORD_NUM_MAP[s]
+    # Compuestos: "forty-two", "treinta y uno", "twenty three"
+    m_comp = re.match(r"^([a-z]+)(?:\s+y\s+|\s+and\s+|[\s-]+)([a-z]+)$", s)
+    if m_comp:
+        a = _WORD_NUM_MAP.get(m_comp.group(1))
+        b = _WORD_NUM_MAP.get(m_comp.group(2))
+        if a is not None and b is not None and a >= 20 and b < 10:
+            return a + b
+    return None
+
+
+def _extract_part_and_chapter_nums(title_norm: str, part_norm: str, first_norm: str) -> Tuple[Optional[int], Optional[int]]:
+    part_num: Optional[int] = None
+    ch_num: Optional[int] = None
+
+    part_source = part_norm or title_norm
+    m_part = re.search(
+        r"(?:part|parte|book|libro)\s+([ivxlcdm]{1,6}|\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|uno|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez)\b",
+        part_source,
+    )
+    if m_part:
+        part_num = _parse_number_token(m_part.group(1))
+    else:
+        m_ord_part = re.search(
+            r"\b(primera|segunda|tercera|cuarta|quinta|sexta|septima|octava|novena|decima|first|second|third|fourth|fifth|sixth)\s+(?:parte|part|libro|book)\b",
+            part_source,
+        )
+        if m_ord_part:
+            part_num = _parse_number_token(m_ord_part.group(1))
+
+    # Tomar la parte local del título (tras '·' si existe prefijo de parte)
+    local_title = title_norm.split("·", 1)[-1].strip() if "·" in title_norm else title_norm
+    m_ch = re.match(r"^(?:chapter|capitulo|cap\.?|ch\.?)\s+([a-z0-9\s-]+?)(?:\s*[:—-]|$)", local_title)
+    if m_ch:
+        ch_num = _parse_number_token(m_ch.group(1))
+    if ch_num is None:
+        ch_num = _parse_number_token(local_title)
+    if ch_num is None:
+        m_lead = re.match(r"^(\d{1,3})(?:\b|[.: -])", local_title)
+        if m_lead:
+            ch_num = int(m_lead.group(1))
+    if ch_num is None and first_norm:
+        m_f = re.match(r"^(?:chapter|capitulo|cap\.?|ch\.?)\s+([a-z0-9\s-]+?)$", first_norm)
+        if m_f:
+            ch_num = _parse_number_token(m_f.group(1))
+        elif len(first_norm) <= 22:
+            ch_num = _parse_number_token(first_norm)
+
+    return part_num, ch_num
+
+
 def _extract_chapter_alignment_profile(ch: Dict[str, Any], median_sentences: float) -> Dict[str, Any]:
     idx = int(ch.get("index", 0))
     title = str(ch.get("title") or f"Capítulo {idx + 1}").strip()
+    part_title = str(ch.get("part_title") or "").strip()
+    explicit_kind = str(ch.get("kind") or "").strip().lower()
     sentences = ch.get("sentences") or []
     sentence_count = int(ch.get("sentence_count") or len(sentences))
     texts = [str(s.get("text") or "").strip() for s in sentences if str(s.get("text") or "").strip()]
@@ -1193,6 +1404,7 @@ def _extract_chapter_alignment_profile(ch: Dict[str, Any], median_sentences: flo
             ending_text = "..." + ending_text[-167:].lstrip()
 
     title_norm = _strip_accents_lower(title)
+    part_norm = _strip_accents_lower(part_title)
     first_norm = _strip_accents_lower(texts[0]) if texts else ""
     combined_head = f"{title_norm} {first_norm}".strip()
 
@@ -1203,22 +1415,47 @@ def _extract_chapter_alignment_profile(ch: Dict[str, Any], median_sentences: flo
     )
 
     kind = "chapter"
+    part_num: Optional[int] = None
     chapter_num: Optional[int] = None
 
     front_back_kw = (
-        "title page", "portada", "copyright", "creditos", "dedication", "dedicatoria",
-        "epigraph", "epigrafe", "contents", "table of contents", "indice", "sumario",
-        "acknowledgment", "agradecimiento", "about the author", "sobre el autor",
-        "sobre matt", "sobre este libro", "also by", "mailing list", "patreon",
-        "critical acclaim", "available august", "notas", "personajes", "apendice",
-        "appendix", "material adicional", "it's over", "its over", "one more",
-        "facebook group",
+        "title page", "portada", "portadilla", "copyright", "creditos", "credits",
+        "dedication", "dedicatoria", "epigraph", "epigrafe", "contents", "table of contents",
+        "indice", "sumario", "acknowledgment", "acknowledgments", "agradecimiento", "agradecimientos",
+        "about the author", "sobre el autor", "about the publisher", "sobre la editorial",
+        "sobre matt", "sobre este libro", "also by", "other works", "mailing list", "patreon",
+        "critical acclaim", "praise", "available august", "notas", "notes", "nota del autor",
+        "personajes", "apendice", "appendix", "material adicional", "it's over", "its over",
+        "one more", "facebook group", "sinopsis", "synopsis", "informacion editorial", "publisher info",
     )
-    divider_kw = re.match(r"^(?:part|parte|book|libro)\s+(?:\d+|[ivxlcdm]+|one|two|three|uno|dos|tres)\b", title_norm)
+    divider_kw = re.match(
+        r"^(?:(?:part|parte|book|libro)\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|uno|dos|tres|cuatro|cinco|seis)|(?:primera|segunda|tercera|cuarta)\s+parte)\b",
+        title_norm,
+    )
 
-    if any(kw in title_norm for kw in ("contents", "table of contents", "indice", "sumario")):
+    if explicit_kind in ("front_matter", "back_matter", "divider", "prologue", "epilogue", "interlude", "chapter"):
+        if explicit_kind == "back_matter":
+            kind = "front_matter"
+        elif explicit_kind == "front_matter":
+            if "dedication" in title_norm or "dedicatoria" in title_norm:
+                kind = "dedication"
+            elif "epigraph" in title_norm or "epigrafe" in title_norm:
+                kind = "epigraph"
+            else:
+                kind = "front_matter"
+        elif explicit_kind == "prologue":
+            kind = "prologue"
+            chapter_num = 0
+        elif explicit_kind == "epilogue":
+            kind = "epilogue"
+            chapter_num = 999
+        elif explicit_kind == "interlude":
+            kind = "chapter"
+        else:
+            kind = explicit_kind
+    elif any(kw in title_norm for kw in ("contents", "table of contents", "indice", "sumario")):
         kind = "front_matter"
-    elif divider_kw and sentence_count <= 8:
+    elif divider_kw and sentence_count <= 12:
         kind = "divider"
     elif re.search(r"\b(?:prologue|prologo|preface|prefacio)\b", combined_head) and sentence_count >= 12:
         kind = "prologue"
@@ -1244,19 +1481,9 @@ def _extract_chapter_alignment_profile(ch: Dict[str, Any], median_sentences: flo
             kind = "front_matter"
 
     if kind == "chapter" and not is_fallback_title:
-        m_num = re.match(r"^(?:chapter|capitulo|cap\.?|ch\.?)\s*(\d{1,3})\b", title_norm)
-        if not m_num:
-            m_num = re.match(r"^(\d{1,3})(?:\b|[.: -])", title_norm)
-        if not m_num and first_norm:
-            m_num = re.match(r"^(?:chapter|capitulo|cap\.?|ch\.?)\s*(\d{1,3})\b", first_norm)
-            if not m_num and len(first_norm) <= 6:
-                m_num = re.match(r"^(\d{1,3})$", first_norm)
-        if m_num:
-            chapter_num = int(m_num.group(1))
-        else:
-            m_rom = re.match(r"^(?:chapter|capitulo|cap\.?|ch\.?)?\s*([ivxlcdm]{1,6})$", title_norm)
-            if m_rom and m_rom.group(1) in _ROMAN_MAP:
-                chapter_num = _ROMAN_MAP[m_rom.group(1)]
+        part_num, chapter_num = _extract_part_and_chapter_nums(title_norm, part_norm, first_norm)
+    elif kind == "divider":
+        part_num, _ = _extract_part_and_chapter_nums(title_norm, part_norm, first_norm)
 
     is_story = kind in ("chapter", "prologue", "epilogue") and sentence_count > max(12, int(median_sentences * 0.07))
 
@@ -1281,11 +1508,13 @@ def _extract_chapter_alignment_profile(ch: Dict[str, Any], median_sentences: flo
     return {
         "index": idx,
         "title": title,
+        "part_title": part_title,
         "sentence_count": sentence_count,
         "word_count": word_count,
         "preview": preview_text,
         "ending_preview": ending_text,
         "kind": kind,
+        "part_num": part_num,
         "chapter_num": chapter_num,
         "is_story": is_story,
         "entities": entities_set,
@@ -1344,7 +1573,16 @@ def _compute_bilingual_chapter_alignment(
             score = 0.42 * len_sim
             reason_parts: List[str] = []
 
-            # Coincidencia por tipo o numeración de capítulo
+            # Coincidencia por tipo, parte o numeración de capítulo
+            pa_part = ca.get("part_num")
+            pb_part = cb.get("part_num")
+            if pa_part is not None and pb_part is not None:
+                if pa_part != pb_part:
+                    score -= 0.48
+                else:
+                    score += 0.14
+                    reason_parts.append(f"Parte {pa_part}")
+
             if ca["kind"] == cb["kind"] and ca["kind"] in ("prologue", "epilogue", "dedication", "epigraph"):
                 score += 0.48
                 reason_parts.append(f"Mismo tipo ({ca['kind']})")
